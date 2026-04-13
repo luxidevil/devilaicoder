@@ -1597,12 +1597,14 @@ requirements.txt → app.py → templates/*.html + static/style.css + static/app
 
       if (agentResult.finishReason?.startsWith("error:")) {
         const detail = agentResult.finishReason.slice(6);
-        if (detail.includes("429") || detail.includes("rate")) {
+        const isRetryable = detail.includes("429") || detail.includes("rate") || detail.includes("503") || detail.includes("UNAVAILABLE") || detail.includes("overloaded") || detail.includes("high demand") || detail.includes("500");
+        if (isRetryable) {
           const backoff = Math.min(5000 * Math.pow(2, emptyResponseCount), 60000);
-          sendEvent({ type: "thinking", content: `Rate limited. Waiting ${Math.round(backoff / 1000)}s...` });
+          const reason = detail.includes("503") || detail.includes("UNAVAILABLE") ? "Model temporarily unavailable" : "Rate limited";
+          sendEvent({ type: "thinking", content: `${reason}. Retrying in ${Math.round(backoff / 1000)}s...` });
           await new Promise(r => setTimeout(r, backoff));
           emptyResponseCount++;
-          if (emptyResponseCount >= 5) { sendEvent({ type: "error", content: "Rate limited too many times." }); break; }
+          if (emptyResponseCount >= 5) { sendEvent({ type: "error", content: `${reason} after multiple retries. Try again in a few minutes.` }); break; }
           continue;
         }
         sendEvent({ type: "error", content: `AI error: ${detail}` });
