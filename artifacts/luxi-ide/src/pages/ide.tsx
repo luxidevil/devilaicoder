@@ -330,6 +330,7 @@ export default function IDE() {
 
   const [showPreview, setShowPreview] = useState(false);
   const [previewUrl, setPreviewUrl] = useState("");
+  const [previewKey, setPreviewKey] = useState(0);
 
   const [chatMode, setChatMode] = useState<ChatMode>("agent");
 
@@ -650,6 +651,7 @@ export default function IDE() {
                 const port = (event as any).port;
                 setPreviewUrl(`http://localhost:${port}`);
                 setShowPreview(true);
+                setPreviewKey((k) => k + 1);
               }
             } catch {}
           }
@@ -849,117 +851,146 @@ export default function IDE() {
 
         <Panel defaultSize={50} minSize={30} className="flex flex-col overflow-hidden">
           <div className="flex flex-col flex-1 overflow-hidden">
-            {!terminalMaximized && !showPreview && (
-              <>
-                {selectedFile ? (
-                  <>
-                    <div className="flex items-center h-9 px-3 border-b border-border bg-card gap-2 flex-shrink-0">
-                      <span className={cn("text-[10px] font-mono px-1.5 py-0.5 rounded", getLanguageBadgeColor(editorLanguage))}>
-                        {editorLanguage}
-                      </span>
-                      <span className="text-xs text-muted-foreground font-mono">{selectedFile.path}</span>
-                    </div>
-                    <div className={cn("overflow-hidden", showTerminal ? "flex-1 min-h-0" : "flex-1")}>
-                      <Editor
-                        height="100%"
-                        theme="vs-dark"
-                        language={editorLanguage}
-                        value={editorContent}
-                        onChange={handleEditorChange}
-                        onMount={(editor) => { editorRef.current = editor; }}
-                        loading={
-                          <div className="flex items-center justify-center h-full gap-2 text-muted-foreground">
-                            <Loader2 className="w-5 h-5 animate-spin" />
-                            <span className="text-sm">Loading editor...</span>
+            {!terminalMaximized && (
+              <div className="flex-1 flex flex-col min-h-0">
+                <PanelGroup direction="horizontal" className="flex-1">
+                  <Panel defaultSize={showPreview ? 50 : 100} minSize={20} className="flex flex-col min-h-0">
+                    {selectedFile ? (
+                      <>
+                        <div className="flex items-center h-9 px-3 border-b border-border bg-card gap-2 flex-shrink-0">
+                          <span className={cn("text-[10px] font-mono px-1.5 py-0.5 rounded", getLanguageBadgeColor(editorLanguage))}>
+                            {editorLanguage}
+                          </span>
+                          <span className="text-xs text-muted-foreground font-mono">{selectedFile.path}</span>
+                        </div>
+                        <div className="flex-1 overflow-hidden">
+                          <Editor
+                            height="100%"
+                            theme="vs-dark"
+                            language={editorLanguage}
+                            value={editorContent}
+                            onChange={handleEditorChange}
+                            onMount={(editor) => { editorRef.current = editor; }}
+                            loading={
+                              <div className="flex items-center justify-center h-full gap-2 text-muted-foreground">
+                                <Loader2 className="w-5 h-5 animate-spin" />
+                                <span className="text-sm">Loading editor...</span>
+                              </div>
+                            }
+                            options={{
+                              fontSize: 13,
+                              fontFamily: "'Geist Mono', 'Fira Code', 'JetBrains Mono', monospace",
+                              fontLigatures: true,
+                              minimap: { enabled: false },
+                              scrollBeyondLastLine: false,
+                              wordWrap: "on",
+                              lineNumbers: "on",
+                              renderLineHighlight: "line",
+                              padding: { top: 12 },
+                              smoothScrolling: true,
+                              cursorBlinking: "smooth",
+                              cursorSmoothCaretAnimation: "on",
+                              tabSize: 2,
+                              bracketPairColorization: { enabled: true },
+                              autoClosingBrackets: "always",
+                              autoClosingQuotes: "always",
+                              formatOnPaste: true,
+                              suggest: { preview: true, showMethods: true, showFunctions: true },
+                              quickSuggestions: { other: true, comments: false, strings: true },
+                              parameterHints: { enabled: true },
+                            }}
+                          />
+                        </div>
+                      </>
+                    ) : (
+                      <div className="flex-1 flex items-center justify-center text-center p-8">
+                        <div>
+                          <div className="w-16 h-16 bg-muted rounded-full flex items-center justify-center mx-auto mb-4">
+                            <File className="w-8 h-8 text-muted-foreground" />
                           </div>
-                        }
-                        options={{
-                          fontSize: 13,
-                          fontFamily: "'Geist Mono', 'Fira Code', 'JetBrains Mono', monospace",
-                          fontLigatures: true,
-                          minimap: { enabled: false },
-                          scrollBeyondLastLine: false,
-                          wordWrap: "on",
-                          lineNumbers: "on",
-                          renderLineHighlight: "line",
-                          padding: { top: 12 },
-                          smoothScrolling: true,
-                          cursorBlinking: "smooth",
-                          cursorSmoothCaretAnimation: "on",
-                          tabSize: 2,
-                          bracketPairColorization: { enabled: true },
-                          autoClosingBrackets: "always",
-                          autoClosingQuotes: "always",
-                          formatOnPaste: true,
-                          suggest: { preview: true, showMethods: true, showFunctions: true },
-                          quickSuggestions: { other: true, comments: false, strings: true },
-                          parameterHints: { enabled: true },
-                        }}
-                      />
-                    </div>
-                  </>
-                ) : (
-                  <div className={cn("flex items-center justify-center text-center p-8", showTerminal ? "flex-1 min-h-0" : "flex-1")}>
-                    <div>
-                      <div className="w-16 h-16 bg-muted rounded-full flex items-center justify-center mx-auto mb-4">
-                        <File className="w-8 h-8 text-muted-foreground" />
+                          <h3 className="text-sm font-medium text-muted-foreground mb-2">No file selected</h3>
+                          <p className="text-xs text-muted-foreground/60 mb-4">Select a file from the sidebar or ask the agent to build something.</p>
+                          <Button size="sm" variant="outline" onClick={() => setShowNewFileDialog(true)} className="text-xs">
+                            <FilePlus className="w-3 h-3 mr-1" />
+                            New file
+                          </Button>
+                        </div>
                       </div>
-                      <h3 className="text-sm font-medium text-muted-foreground mb-2">No file selected</h3>
-                      <p className="text-xs text-muted-foreground/60 mb-4">Select a file from the sidebar or ask the agent to build something.</p>
-                      <Button size="sm" variant="outline" onClick={() => setShowNewFileDialog(true)} className="text-xs">
-                        <FilePlus className="w-3 h-3 mr-1" />
-                        New file
-                      </Button>
-                    </div>
-                  </div>
-                )}
-              </>
-            )}
-            {showPreview && !terminalMaximized && (
-              <div className="flex flex-col flex-1 min-h-0 border-t border-border">
-                <div className="flex items-center h-8 px-3 bg-card border-b border-border gap-2 flex-shrink-0">
-                  <Globe className="w-3 h-3 text-primary/70" />
-                  <input
-                    type="text"
-                    value={previewUrl}
-                    onChange={(e) => setPreviewUrl(e.target.value)}
-                    placeholder="Enter URL to preview (auto-fills when agent starts a server)..."
-                    className="flex-1 text-xs bg-transparent border-none outline-none font-mono text-foreground placeholder:text-muted-foreground"
-                    onKeyDown={(e) => e.key === "Enter" && setPreviewUrl((e.target as HTMLInputElement).value)}
-                  />
-                  {previewUrl && (
-                    <button
-                      onClick={() => {
-                        const iframe = document.querySelector("[data-preview-iframe]") as HTMLIFrameElement;
-                        if (iframe) { iframe.src = previewUrl; }
-                      }}
-                      className="p-0.5 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
-                      title="Refresh"
-                    >
-                      <Play className="w-3 h-3" />
-                    </button>
+                    )}
+                  </Panel>
+
+                  {showPreview && (
+                    <>
+                      <PanelResizeHandle className="w-px bg-border hover:bg-primary/50 transition-colors cursor-col-resize" />
+                      <Panel defaultSize={50} minSize={20} className="flex flex-col min-h-0">
+                        <div className="flex items-center h-9 px-3 bg-card border-b border-border gap-2 flex-shrink-0">
+                          <Globe className="w-3 h-3 text-primary/70" />
+                          <div className="flex-1 flex items-center bg-background/50 rounded px-2 py-0.5 border border-border/50">
+                            <input
+                              type="text"
+                              value={previewUrl}
+                              onChange={(e) => setPreviewUrl(e.target.value)}
+                              placeholder="localhost:3000"
+                              className="flex-1 text-[11px] bg-transparent border-none outline-none font-mono text-foreground placeholder:text-muted-foreground"
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  setPreviewKey((k) => k + 1);
+                                }
+                              }}
+                            />
+                          </div>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                onClick={() => setPreviewKey((k) => k + 1)}
+                                className="p-1 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+                              >
+                                <Play className="w-3 h-3" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent>Refresh preview</TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                onClick={() => {
+                                  if (previewUrl) window.open(previewUrl, "_blank");
+                                }}
+                                className="p-1 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+                              >
+                                <Globe className="w-3 h-3" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent>Open in new tab</TooltipContent>
+                          </Tooltip>
+                          <button
+                            onClick={() => setShowPreview(false)}
+                            className="p-1 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                        {previewUrl ? (
+                          <iframe
+                            key={previewKey}
+                            src={previewUrl}
+                            className="flex-1 w-full bg-white"
+                            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+                          />
+                        ) : (
+                          <div className="flex-1 flex items-center justify-center text-muted-foreground text-xs flex-col gap-2 bg-muted/20">
+                            <Globe className="w-8 h-8 opacity-20" />
+                            <span className="text-center px-4">The preview will appear here automatically when the agent starts a server</span>
+                          </div>
+                        )}
+                      </Panel>
+                    </>
                   )}
-                  <button onClick={() => setShowPreview(false)} className="p-0.5 rounded hover:bg-muted transition-colors text-muted-foreground">
-                    <EyeOff className="w-3 h-3" />
-                  </button>
-                </div>
-                {previewUrl ? (
-                  <iframe
-                    data-preview-iframe
-                    src={previewUrl}
-                    className="flex-1 w-full bg-white"
-                    sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-                  />
-                ) : (
-                  <div className="flex-1 flex items-center justify-center text-muted-foreground text-xs flex-col gap-2">
-                    <Globe className="w-8 h-8 opacity-30" />
-                    <span>Ask the agent to build a web app — the preview will appear here automatically</span>
-                  </div>
-                )}
+                </PanelGroup>
               </div>
             )}
             {showTerminal && (
-              <div className={cn(terminalMaximized ? "flex-1" : "h-[250px] min-h-[150px]")}>
+              <div className={cn(terminalMaximized ? "flex-1" : "h-[250px] min-h-[150px]", "border-t border-border")}>
                 <TerminalPanel
                   isOpen={showTerminal}
                   onClose={() => { setShowTerminal(false); setTerminalMaximized(false); }}
