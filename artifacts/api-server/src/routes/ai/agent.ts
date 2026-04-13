@@ -1,5 +1,5 @@
 import { Router, type IRouter } from "express";
-import { db, filesTable, aiRequestsTable } from "@workspace/db";
+import { db, filesTable, aiRequestsTable, projectsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "../../lib/logger";
 import { exec, spawn } from "child_process";
@@ -25,6 +25,96 @@ const PROJECTS_ROOT = pathLib.join(process.env.HOME || "/home/runner", "projects
 
 function getProjectDir(projectId: number): string {
   return pathLib.join(PROJECTS_ROOT, String(projectId));
+}
+
+async function getProjectSSH(projectId: number) {
+  const [project] = await db.select().from(projectsTable).where(eq(projectsTable.id, projectId));
+  if (!project?.sshHost || (!project.sshPassword && !project.sshKey)) return null;
+  return {
+    host: project.sshHost,
+    user: project.sshUser || "root",
+    port: project.sshPort || 22,
+    password: project.sshPassword || undefined,
+    privateKey: project.sshKey || undefined,
+    remotePath: project.sshRemotePath || "/var/www/app",
+    domain: project.sshDomain || project.sshHost,
+  };
+}
+
+async function autoDeploySSH(
+  projectDir: string,
+  ssh: NonNullable<Awaited<ReturnType<typeof getProjectSSH>>>,
+  sendEvent: (e: Record<string, any>) => void
+): Promise<{ success: boolean; url: string; error?: string }> {
+  const liveUrl = ssh.domain.startsWith("http") ? ssh.domain : `http://${ssh.domain}`;
+  try {
+    sendEvent({ type: "tool_call", id: "auto_deploy", tool: "deploy_ssh", args: { host: ssh.host, remotePath: ssh.remotePath } });
+
+    const conn = new SSHClient();
+    await new Promise<void>((resolve, reject) => {
+      conn.on("ready", () => resolve());
+      conn.on("error", (err) => reject(err));
+      const config: any = { host: ssh.host, port: ssh.port, username: ssh.user, readyTimeout: 15000 };
+      if (ssh.privateKey) config.privateKey = ssh.privateKey;
+      else config.password = ssh.password;
+      conn.connect(config);
+    });
+
+    const sshExec = (cmd: string): Promise<{ stdout: string; stderr: string; code: number }> => {
+      return new Promise((resolve, reject) => {
+        conn.exec(cmd, (err, stream) => {
+          if (err) return reject(err);
+          let stdout = "";
+          let stderr = "";
+          stream.on("data", (data: Buffer) => { stdout += data.toString(); });
+          stream.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+          stream.on("close", (code: number) => { resolve({ stdout, stderr, code }); });
+        });
+      });
+    };
+
+    await sshExec(`mkdir -p ${ssh.remotePath}`);
+
+    const tarName = `deploy_${Date.now()}.tar.gz`;
+    const localTar = pathLib.join(projectDir, `../${tarName}`);
+    await execAsync(
+      `tar czf "${localTar}" --exclude=node_modules --exclude=.git --exclude=__pycache__ --exclude=dist --exclude=venv --exclude=.next -C "${projectDir}" .`,
+      { timeout: 30_000 }
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      conn.sftp((err, sftp) => {
+        if (err) return reject(err);
+        const readStream = fs.createReadStream(localTar);
+        const writeStream = sftp.createWriteStream(`${ssh.remotePath}/${tarName}`);
+        writeStream.on("close", () => resolve());
+        writeStream.on("error", (e: Error) => reject(e));
+        readStream.pipe(writeStream);
+      });
+    });
+
+    await sshExec(`cd ${ssh.remotePath} && tar xzf ${tarName} && rm ${tarName}`);
+    await fsPromises.unlink(localTar).catch(() => {});
+
+    const pkgExists = await sshExec(`test -f ${ssh.remotePath}/package.json && echo yes || echo no`);
+    if (pkgExists.stdout.trim() === "yes") {
+      await sshExec(`cd ${ssh.remotePath} && npm install --production 2>&1 | tail -5`);
+      await sshExec(`cd ${ssh.remotePath} && (pm2 restart all 2>/dev/null || (pm2 start npm --name app -- start 2>/dev/null || true))`);
+    }
+
+    const reqExists = await sshExec(`test -f ${ssh.remotePath}/requirements.txt && echo yes || echo no`);
+    if (reqExists.stdout.trim() === "yes") {
+      await sshExec(`cd ${ssh.remotePath} && pip install -r requirements.txt 2>&1 | tail -5`);
+    }
+
+    conn.end();
+    sendEvent({ type: "tool_result", id: "auto_deploy", tool: "deploy_ssh", result: `Deployed to ${ssh.host}` });
+    return { success: true, url: liveUrl };
+  } catch (err: any) {
+    logger.error({ err }, "Auto-deploy SSH failed");
+    sendEvent({ type: "tool_result", id: "auto_deploy", tool: "deploy_ssh", result: `Deploy failed: ${err.message}` });
+    return { success: false, url: liveUrl, error: err.message };
+  }
 }
 
 async function ensureProjectDir(projectId: number): Promise<string> {
@@ -1276,6 +1366,7 @@ router.post("/ai/agent", async (req, res): Promise<void> => {
 
   try {
     const projectDir = await syncAllFilesToDisk(projectId);
+    const sshConfig = await getProjectSSH(projectId);
 
     const projectFiles = await db.select({ name: filesTable.name, path: filesTable.path }).from(filesTable).where(eq(filesTable.projectId, projectId));
     const fileList = projectFiles.map(f => f.path).join(", ") || "No files yet — empty project";
@@ -1329,9 +1420,9 @@ Project files: ${fileList}
 - **download_file**: Download a file from URL to project
 
 ### Testing & Deploy
-- **check_port**: Verify a server is running → auto-opens live preview in user's browser!
+- **check_port**: Verify a server is running → auto-opens live preview. If SSH is configured, code is auto-deployed to the server!
 - **test_api**: Full HTTP API testing with assertions
-- **deploy_ssh**: Deploy to any server via SSH (SFTP upload + remote commands)
+- **deploy_ssh**: Deploy to any server via SSH (SFTP upload + remote commands). NOTE: If the user has configured SSH settings, deployment happens automatically when the agent finishes. Use deploy_ssh only for custom/manual deployments.
 
 ### Version Control
 - **git_operation**: Full git operations (init, add, commit, push, pull, branch, etc.)
@@ -1526,7 +1617,16 @@ requirements.txt → app.py → templates/*.html + static/style.css + static/app
             });
 
             if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
-            if (previewPort) sendEvent({ type: "preview_port", port: previewPort });
+            if (previewPort) {
+              if (sshConfig) {
+                const deployResult = await autoDeploySSH(projectDir, sshConfig, sendEvent);
+                if (deployResult.success) {
+                  sendEvent({ type: "preview_url", url: deployResult.url });
+                }
+              } else {
+                sendEvent({ type: "preview_port", port: previewPort });
+              }
+            }
             functionResponses.push({ functionResponse: { name: tc.name, response: { result: compacted } } });
           }
         } else {
@@ -1561,7 +1661,16 @@ requirements.txt → app.py → templates/*.html + static/style.css + static/app
             });
 
             if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
-            if (previewPort) sendEvent({ type: "preview_port", port: previewPort });
+            if (previewPort) {
+              if (sshConfig) {
+                const deployResult = await autoDeploySSH(projectDir, sshConfig, sendEvent);
+                if (deployResult.success) {
+                  sendEvent({ type: "preview_url", url: deployResult.url });
+                }
+              } else {
+                sendEvent({ type: "preview_port", port: previewPort });
+              }
+            }
             functionResponses.push({ functionResponse: { name: tc.name, response: { result: compacted } } });
           }
         }
@@ -1581,6 +1690,14 @@ requirements.txt → app.py → templates/*.html + static/style.css + static/app
     }
 
     await scanDiskForNewFiles(projectId, projectDir);
+
+    if (sshConfig) {
+      const deployResult = await autoDeploySSH(projectDir, sshConfig, sendEvent);
+      if (deployResult.success) {
+        sendEvent({ type: "preview_url", url: deployResult.url });
+      }
+    }
+
     sendEvent({ type: "done" });
     res.end();
   } catch (err: any) {

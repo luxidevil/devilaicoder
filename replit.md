@@ -69,7 +69,8 @@ The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
 - Project memory: .luxi/memory.md persists architectural decisions across conversations
 - Todo tracking: agent shows its task list to the user, updates as it completes steps
 - Shell tool: execute multiple commands in sequence (faster than multiple run_command calls)
-- Zero-refusal system prompt: agent never lectures, never refuses, builds exactly what's asked
+- Professional execution engine prompt: agent framed as a compiler/tutor, no refusal language
+- SSH auto-deploy: when user configures SSH credentials, agent auto-deploys to their server after every build
 
 ### AI Provider Format Conversions
 - Agent internally uses Gemini's content format (role/parts with functionCall/functionResponse)
@@ -82,8 +83,10 @@ The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
 - File list polls every 3 seconds for agent-created files
 - Agent panel supports file attachment (drag & drop or click) for HAR/JSON/CSV analysis
 - Live preview pane: auto-opens when agent's check_port succeeds, shows the running app in an iframe
-- preview_port event: agent emits this when a port check passes → frontend auto-sets URL and opens preview
+- preview_port event: agent emits this when a port check passes → frontend auto-sets URL and opens preview (local mode)
+- preview_url event: agent emits this after SSH auto-deploy → frontend shows the live deployed URL in the preview pane
 - Preview has refresh button, URL bar, and close button
+- SSH Settings dialog: accessible via Server icon in toolbar. User can configure SSH host, port, username, password/key, remote path, and domain. When configured, all agent builds auto-deploy to the server.
 
 ### Terminal
 WebSocket terminal at `/api/ws/terminal` using node-pty for real shell access.
@@ -98,6 +101,6 @@ WebSocket terminal at `/api/ws/terminal` using node-pty for real shell access.
 
 ## Database Schema
 
-Tables: projects (name, description, createdAt, updatedAt), files (projectId, name, path, content, language), conversations (projectId, title), messages (conversationId, role, content, toolCalls), settings (key, value), ai_requests (projectId, createdAt)
+Tables: projects (name, description, language, sshHost, sshUser, sshPort, sshPassword, sshKey, sshRemotePath, sshDomain, createdAt, updatedAt), files (projectId, name, path, content, language), conversations (projectId, title), messages (conversationId, role, content, toolCalls), settings (key, value), ai_requests (projectId, createdAt)
 
 See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details.

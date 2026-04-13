@@ -47,6 +47,9 @@ import {
   Upload,
   MessageCircle,
   Cpu,
+  Server,
+  Shield,
+  ExternalLink,
 } from "lucide-react";
 import { Link } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
@@ -95,6 +98,7 @@ type AgentEvent =
   | { type: "tool_result"; id: string; tool: string; result: string }
   | { type: "file_changed"; path: string; action: string }
   | { type: "preview_port"; port: number }
+  | { type: "preview_url"; url: string }
   | { type: "message"; content: string }
   | { type: "error"; content: string }
   | { type: "done" };
@@ -349,6 +353,14 @@ export default function IDE() {
   const [previewKey, setPreviewKey] = useState(0);
 
   const [chatMode, setChatMode] = useState<ChatMode>("agent");
+  const [showSSHSettings, setShowSSHSettings] = useState(false);
+  const [sshForm, setSSHForm] = useState({
+    sshHost: "", sshUser: "root", sshPort: "22",
+    sshPassword: "", sshKey: "", sshRemotePath: "/var/www/app", sshDomain: "",
+  });
+  const [sshConfigured, setSSHConfigured] = useState(false);
+  const [sshSaving, setSSHSaving] = useState(false);
+  const [sshShowKey, setSSHShowKey] = useState(false);
 
   const selectedFile = files?.find((f) => f.id === selectedFileId);
 
@@ -375,6 +387,42 @@ export default function IDE() {
   useEffect(() => {
     agentBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [agentEvents]);
+
+  useEffect(() => {
+    if (projectId) {
+      fetch(`/api/projects/${projectId}/ssh`).then(r => r.json()).then(data => {
+        setSSHConfigured(data.configured);
+      }).catch(() => {});
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (showSSHSettings && projectId) {
+      fetch(`/api/projects/${projectId}/ssh`).then(r => r.json()).then(data => {
+        setSSHForm({
+          sshHost: data.sshHost || "", sshUser: data.sshUser || "root",
+          sshPort: String(data.sshPort || 22), sshPassword: data.sshPassword || "",
+          sshKey: data.sshKey || "", sshRemotePath: data.sshRemotePath || "/var/www/app",
+          sshDomain: data.sshDomain || "",
+        });
+        setSSHConfigured(data.configured);
+      }).catch(() => {});
+    }
+  }, [showSSHSettings, projectId]);
+
+  const saveSSHSettings = async () => {
+    setSSHSaving(true);
+    try {
+      const res = await fetch(`/api/projects/${projectId}/ssh`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(sshForm),
+      });
+      const data = await res.json();
+      setSSHConfigured(data.configured);
+      if (data.configured) setShowSSHSettings(false);
+    } catch {}
+    setSSHSaving(false);
+  };
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -669,6 +717,11 @@ export default function IDE() {
                 setShowPreview(true);
                 setPreviewKey((k) => k + 1);
               }
+              if (event.type === "preview_url" && (event as any).url) {
+                setPreviewUrl((event as any).url);
+                setShowPreview(true);
+                setPreviewKey((k) => k + 1);
+              }
             } catch {}
           }
         }
@@ -767,6 +820,21 @@ export default function IDE() {
               </button>
             </TooltipTrigger>
             <TooltipContent>Keyboard shortcuts</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={() => setShowSSHSettings(true)}
+                className={cn(
+                  "p-1.5 rounded transition-colors",
+                  sshConfigured ? "text-emerald-400 hover:bg-emerald-500/10" : "hover:bg-muted text-muted-foreground hover:text-foreground"
+                )}
+                data-testid="button-ssh-settings"
+              >
+                <Server className="w-4 h-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>{sshConfigured ? "SSH Server (configured)" : "SSH Server Settings"}</TooltipContent>
           </Tooltip>
           <Link href="/admin">
             <button className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground" data-testid="link-admin">
@@ -1211,6 +1279,20 @@ export default function IDE() {
                         </motion.div>
                       );
 
+                    case "preview_url":
+                      return (
+                        <motion.div
+                          key={i}
+                          initial={{ opacity: 0, scale: 0.95 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          className="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-emerald-500/10 border border-emerald-500/20 text-xs"
+                        >
+                          <Globe className="w-3 h-3 text-emerald-400" />
+                          <span className="text-emerald-400 font-medium">Deployed & live</span>
+                          <a href={(event as any).url} target="_blank" rel="noopener noreferrer" className="text-emerald-300 font-mono text-[11px] underline hover:text-emerald-200">{(event as any).url}</a>
+                        </motion.div>
+                      );
+
                     case "message":
                       return (
                         <div key={i} className="flex gap-2 items-start">
@@ -1415,6 +1497,102 @@ export default function IDE() {
               disabled={deleteFile.isPending}
             >
               Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showSSHSettings} onOpenChange={setShowSSHSettings}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Server className="w-5 h-5" />
+              SSH Server Settings
+              {sshConfigured && <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">Connected</span>}
+            </DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-muted-foreground -mt-2">
+            Connect your server to auto-deploy and preview your projects live. Code is pushed to your server every time the agent builds something.
+          </p>
+          <div className="space-y-3">
+            <div className="grid grid-cols-3 gap-2">
+              <div className="col-span-2">
+                <label className="text-xs text-muted-foreground mb-1 block">Host / IP</label>
+                <Input
+                  placeholder="192.168.1.1 or myserver.com"
+                  value={sshForm.sshHost}
+                  onChange={e => setSSHForm(f => ({ ...f, sshHost: e.target.value }))}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground mb-1 block">Port</label>
+                <Input
+                  placeholder="22"
+                  value={sshForm.sshPort}
+                  onChange={e => setSSHForm(f => ({ ...f, sshPort: e.target.value }))}
+                />
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Username</label>
+              <Input
+                placeholder="root"
+                value={sshForm.sshUser}
+                onChange={e => setSSHForm(f => ({ ...f, sshUser: e.target.value }))}
+              />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 block">Password (leave empty if using SSH key)</label>
+              <Input
+                type="password"
+                placeholder="••••••••"
+                value={sshForm.sshPassword}
+                onChange={e => setSSHForm(f => ({ ...f, sshPassword: e.target.value }))}
+              />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground mb-1 flex items-center gap-1">
+                <Shield className="w-3 h-3" /> SSH Private Key (optional)
+                <button onClick={() => setSSHShowKey(!sshShowKey)} className="ml-auto text-primary text-[10px]">{sshShowKey ? "Hide" : "Show"}</button>
+              </label>
+              {sshShowKey && (
+                <textarea
+                  className="w-full h-24 bg-background border border-border rounded-md px-3 py-2 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-primary"
+                  placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..."
+                  value={sshForm.sshKey}
+                  onChange={e => setSSHForm(f => ({ ...f, sshKey: e.target.value }))}
+                />
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-xs text-muted-foreground mb-1 block">Remote Path</label>
+                <Input
+                  placeholder="/var/www/app"
+                  value={sshForm.sshRemotePath}
+                  onChange={e => setSSHForm(f => ({ ...f, sshRemotePath: e.target.value }))}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-muted-foreground mb-1 flex items-center gap-1">
+                  <ExternalLink className="w-3 h-3" /> Domain / URL
+                </label>
+                <Input
+                  placeholder="myapp.com or http://1.2.3.4:3000"
+                  value={sshForm.sshDomain}
+                  onChange={e => setSSHForm(f => ({ ...f, sshDomain: e.target.value }))}
+                />
+              </div>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Domain is used for the live preview URL. If empty, the host IP will be used.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowSSHSettings(false)}>Cancel</Button>
+            <Button onClick={saveSSHSettings} disabled={sshSaving || !sshForm.sshHost}>
+              {sshSaving ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : <Server className="w-4 h-4 mr-2" />}
+              {sshSaving ? "Saving..." : "Save Connection"}
             </Button>
           </DialogFooter>
         </DialogContent>
