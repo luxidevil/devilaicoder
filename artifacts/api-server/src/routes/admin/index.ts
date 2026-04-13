@@ -51,9 +51,9 @@ router.get("/admin/settings", requireAdmin, async (_req, res): Promise<void> => 
   res.json({
     provider,
     model: model ?? defaultModel,
-    geminiKeyConfigured: !!geminiKey,
-    anthropicKeyConfigured: !!anthropicKey,
-    openaiKeyConfigured: !!openaiKey,
+    geminiKeyConfigured: !!(geminiKey || process.env.GOOGLE_API_KEY),
+    anthropicKeyConfigured: !!(anthropicKey || process.env.ANTHROPIC_API_KEY),
+    openaiKeyConfigured: !!(openaiKey || process.env.OPENAI_API_KEY),
     providerModels: PROVIDER_MODELS,
     updatedAt: updatedAt ?? null,
   });

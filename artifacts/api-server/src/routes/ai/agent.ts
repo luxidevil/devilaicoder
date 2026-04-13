@@ -206,7 +206,18 @@ const toolDeclarations: ToolDeclaration[] = [
     parameters: {
       type: "OBJECT",
       properties: {
-        files: { type: "STRING", description: "JSON array of objects with 'path' and 'content' fields, e.g. [{\"path\":\"server.js\",\"content\":\"...\"}]" },
+        files: {
+          type: "ARRAY",
+          description: "Array of file objects to write",
+          items: {
+            type: "OBJECT",
+            properties: {
+              path: { type: "STRING", description: "File path relative to project root" },
+              content: { type: "STRING", description: "Full file content" },
+            },
+            required: ["path", "content"],
+          },
+        },
       },
       required: ["files"],
     },
@@ -639,10 +650,27 @@ async function executeTool(
     }
 
     case "batch_write_files": {
-      const filesStr = args.files as string;
+      let filesInput = args.files;
       let fileList: { path: string; content: string }[];
       try {
-        fileList = JSON.parse(filesStr);
+        if (typeof filesInput === "string") {
+          try {
+            fileList = JSON.parse(filesInput);
+          } catch {
+            const sanitized = filesInput
+              .replace(/[\x00-\x1f]/g, (ch: string) => {
+                if (ch === '\n') return '\\n';
+                if (ch === '\r') return '\\r';
+                if (ch === '\t') return '\\t';
+                return '';
+              });
+            fileList = JSON.parse(sanitized);
+          }
+        } else if (Array.isArray(filesInput)) {
+          fileList = filesInput;
+        } else {
+          return { result: "Error: files must be a JSON array string or array" };
+        }
       } catch (err: any) {
         return { result: `Error parsing files JSON: ${err.message}` };
       }

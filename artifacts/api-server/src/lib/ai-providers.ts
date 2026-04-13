@@ -1,4 +1,5 @@
 import { db, settingsTable } from "@workspace/db";
+import { logger } from "./logger";
 
 export type ProviderName = "gemini" | "anthropic" | "openai";
 
@@ -72,12 +73,18 @@ export async function getActiveProvider(): Promise<ProviderSettings | null> {
   };
 
   const modelMap: Record<ProviderName, string> = {
-    gemini: "gemini-2.0-flash",
+    gemini: "gemini-2.5-flash",
     anthropic: "claude-sonnet-4-20250514",
     openai: "gpt-4o",
   };
 
-  const apiKey = s[keyMap[provider]];
+  const envKeyMap: Record<ProviderName, string> = {
+    gemini: "GOOGLE_API_KEY",
+    anthropic: "ANTHROPIC_API_KEY",
+    openai: "OPENAI_API_KEY",
+  };
+
+  const apiKey = s[keyMap[provider]] || process.env[envKeyMap[provider]];
   if (!apiKey) return null;
 
   const model = s["ai_model"] ?? modelMap[provider];
@@ -86,8 +93,7 @@ export async function getActiveProvider(): Promise<ProviderSettings | null> {
 
 export const PROVIDER_MODELS: Record<ProviderName, { value: string; label: string }[]> = {
   gemini: [
-    { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash (Fast)" },
-    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash (Smarter)" },
+    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash (Fast)" },
     { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro (Most capable)" },
     { value: "gemini-1.5-pro", label: "Gemini 1.5 Pro (Legacy)" },
   ],
@@ -104,6 +110,17 @@ export const PROVIDER_MODELS: Record<ProviderName, { value: string; label: strin
   ],
 };
 
+function convertPropGemini(v: any): any {
+  const out: any = { type: v.type.toUpperCase() };
+  if (v.description) out.description = v.description;
+  if (v.items) out.items = convertPropGemini(v.items);
+  if (v.properties) {
+    out.properties = Object.fromEntries(Object.entries(v.properties).map(([k, pv]: [string, any]) => [k, convertPropGemini(pv)]));
+  }
+  if (v.required) out.required = v.required;
+  return out;
+}
+
 function geminiToolFormat(tools: ToolDeclaration[]) {
   return tools.map((t) => ({
     name: t.name,
@@ -113,14 +130,23 @@ function geminiToolFormat(tools: ToolDeclaration[]) {
       properties: Object.keys(t.parameters.properties).length === 0
         ? undefined
         : Object.fromEntries(
-            Object.entries(t.parameters.properties).map(([k, v]) => [
-              k,
-              { type: v.type.toUpperCase(), description: v.description },
-            ])
+            Object.entries(t.parameters.properties).map(([k, v]) => [k, convertPropGemini(v)])
           ),
       required: t.parameters.required,
     },
   }));
+}
+
+function convertPropJsonSchema(v: any): any {
+  const t = v.type?.toLowerCase?.() ?? "string";
+  const out: any = { type: t === "number" ? "number" : t === "array" ? "array" : t === "object" ? "object" : "string" };
+  if (v.description) out.description = v.description;
+  if (v.items) out.items = convertPropJsonSchema(v.items);
+  if (v.properties) {
+    out.properties = Object.fromEntries(Object.entries(v.properties).map(([k, pv]: [string, any]) => [k, convertPropJsonSchema(pv)]));
+  }
+  if (v.required) out.required = v.required;
+  return out;
 }
 
 function openaiToolFormat(tools: ToolDeclaration[]) {
@@ -132,10 +158,7 @@ function openaiToolFormat(tools: ToolDeclaration[]) {
       parameters: {
         type: "object",
         properties: Object.fromEntries(
-          Object.entries(t.parameters.properties).map(([k, v]) => [
-            k,
-            { type: v.type.toLowerCase() === "number" ? "number" : "string", description: v.description },
-          ])
+          Object.entries(t.parameters.properties).map(([k, v]) => [k, convertPropJsonSchema(v)])
         ),
         required: t.parameters.required ?? [],
       },
@@ -150,10 +173,7 @@ function anthropicToolFormat(tools: ToolDeclaration[]) {
     input_schema: {
       type: "object" as const,
       properties: Object.fromEntries(
-        Object.entries(t.parameters.properties).map(([k, v]) => [
-          k,
-          { type: v.type.toLowerCase() === "number" ? "number" : "string", description: v.description },
-        ])
+        Object.entries(t.parameters.properties).map(([k, v]) => [k, convertPropJsonSchema(v)])
       ),
       required: t.parameters.required ?? [],
     },
@@ -481,6 +501,7 @@ async function agentCallGemini(
   const data = await response.json() as any;
   const candidate = data.candidates?.[0];
   if (!candidate?.content?.parts) {
+    logger.warn({ finishReason: candidate?.finishReason, blockReason: data.promptFeedback?.blockReason, safetyRatings: candidate?.safetyRatings, candidateCount: data.candidates?.length }, "Gemini no_content");
     return { textParts: [], toolCalls: [], finishReason: "no_content" };
   }
 
