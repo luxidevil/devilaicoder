@@ -48,22 +48,28 @@ Each project has a real filesystem directory at `/home/runner/projects/{projectI
 - `list_files` shows both DB files and disk-only files
 - This means the agent can build real apps: write code, install dependencies, start servers, and test them
 
-### Agent Capabilities (23 tools)
+### Agent Capabilities (26 tools, 200 iterations max)
 The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
-- Thinking: think (structured reasoning before complex tasks, inspired by Claude Code)
+- Planning: think (structured reasoning), todowrite (task tracking visible to user), project_memory (persistent context across conversations)
 - File operations: list, read, write, create, delete, edit, batch_write_files, search, find & replace, parse
 - Search: grep (real filesystem grep with regex), search_files (DB search)
-- Execution: run_command (2-min timeout), install_package (3-min timeout), manage_process, read_logs
+- Execution: run_command (2-min timeout), shell (multi-command sequential execution), install_package (3-min timeout), manage_process, read_logs
 - Web: browse_website, web_search, download_file
 - Testing: check_port (auto-opens live preview on success), test_api
 - Deployment: deploy_ssh (deploy to any server via SSH using ssh2 — tar+upload+extract+run setup commands)
 - Version control: git_operation
 
 ### Agent Performance Optimizations (Claude Code inspired)
-- Parallel tool execution: read-only tools (think, read_file, grep, list_files, etc.) run concurrently via Promise.all
+- 200 iteration limit (up from 50) — agent never gives up
+- Parallel tool execution: read-only tools (think, todowrite, read_file, grep, list_files, project_memory, etc.) run concurrently via Promise.all
 - Smart output compaction: large command outputs keep head+tail, file reads truncate with char count
 - Context compression: when conversation exceeds 40 turns, older turns are dropped with a compression note
 - batch_write_files: write multiple files in a single tool call for faster project scaffolding
+- Exponential backoff for rate limits (5s → 10s → 20s → 40s → 60s), up to 5 retries
+- Project memory: .luxi/memory.md persists architectural decisions across conversations
+- Todo tracking: agent shows its task list to the user, updates as it completes steps
+- Shell tool: execute multiple commands in sequence (faster than multiple run_command calls)
+- Zero-refusal system prompt: agent never lectures, never refuses, builds exactly what's asked
 
 ### AI Provider Format Conversions
 - Agent internally uses Gemini's content format (role/parts with functionCall/functionResponse)

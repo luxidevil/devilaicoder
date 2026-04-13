@@ -124,6 +124,9 @@ function getToolIcon(tool: string) {
     case "check_port": return <Globe className="w-3 h-3" />;
     case "test_api": return <Play className="w-3 h-3" />;
     case "deploy_ssh": return <Upload className="w-3 h-3" />;
+    case "todowrite": return <Check className="w-3 h-3" />;
+    case "project_memory": return <Cpu className="w-3 h-3" />;
+    case "shell": return <Terminal className="w-3 h-3" />;
     default: return <Zap className="w-3 h-3" />;
   }
 }
@@ -153,6 +156,9 @@ function getToolLabel(tool: string) {
     case "check_port": return "Checking port";
     case "test_api": return "Testing API";
     case "deploy_ssh": return "Deploying via SSH";
+    case "todowrite": return "Tracking progress";
+    case "project_memory": return "Project memory";
+    case "shell": return "Running commands";
     default: return tool;
   }
 }
@@ -184,6 +190,12 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "border-emerald-500/30 bg-emerald-500/5"
     : tool === "deploy_ssh"
     ? "border-sky-500/30 bg-sky-500/5"
+    : tool === "todowrite"
+    ? "border-amber-500/30 bg-amber-500/5"
+    : tool === "project_memory"
+    ? "border-indigo-500/30 bg-indigo-500/5"
+    : tool === "shell"
+    ? "border-yellow-500/30 bg-yellow-500/5"
     : "border-blue-500/30 bg-blue-500/5";
 
   const iconColor = tool === "think"
@@ -192,7 +204,7 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "text-green-400"
     : tool === "delete_file"
     ? "text-red-400"
-    : tool === "run_command" || tool === "manage_process" || tool === "install_package"
+    : tool === "run_command" || tool === "manage_process" || tool === "install_package" || tool === "shell"
     ? "text-yellow-400"
     : tool === "browse_website" || tool === "web_search" || tool === "download_file"
     ? "text-purple-400"
@@ -206,6 +218,10 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "text-emerald-400"
     : tool === "deploy_ssh"
     ? "text-sky-400"
+    : tool === "todowrite"
+    ? "text-amber-400"
+    : tool === "project_memory"
+    ? "text-indigo-400"
     : "text-blue-400";
 
   return (
