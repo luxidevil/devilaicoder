@@ -98,9 +98,9 @@ router.put("/admin/settings", requireAdmin, async (req, res): Promise<void> => {
   res.json({
     provider: currentProvider,
     model: currentModel ?? defaultModel,
-    geminiKeyConfigured: !!(await getSetting("gemini_api_key")),
-    anthropicKeyConfigured: !!(await getSetting("anthropic_api_key")),
-    openaiKeyConfigured: !!(await getSetting("openai_api_key")),
+    geminiKeyConfigured: !!((await getSetting("gemini_api_key")) || process.env.GOOGLE_API_KEY),
+    anthropicKeyConfigured: !!((await getSetting("anthropic_api_key")) || process.env.ANTHROPIC_API_KEY),
+    openaiKeyConfigured: !!((await getSetting("openai_api_key")) || process.env.OPENAI_API_KEY),
     providerModels: PROVIDER_MODELS,
     updatedAt: new Date().toISOString(),
   });
