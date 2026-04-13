@@ -956,13 +956,34 @@ async function executeTool(
       const allowedOps = ["clone", "init", "add", "commit", "push", "pull", "status", "log", "branch", "checkout", "diff", "remote", "stash", "merge", "reset", "fetch", "tag", "show", "rev-parse", "config"];
       if (!allowedOps.includes(operation)) return { result: `Unsupported: "${operation}". Allowed: ${allowedOps.join(", ")}` };
       try {
-        const { stdout, stderr } = await execAsync(`git ${operation}${gitArgs ? " " + gitArgs : ""}`, {
+        const ghToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
+        let finalArgs = gitArgs;
+        if (ghToken && (operation === "clone" || operation === "push" || operation === "pull" || operation === "fetch")) {
+          finalArgs = finalArgs.replace(
+            /https:\/\/github\.com\//g,
+            `https://${ghToken}@github.com/`
+          );
+        }
+        const gitEnv: Record<string, string> = {
+          ...process.env as Record<string, string>,
+          GIT_TERMINAL_PROMPT: "0",
+          GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=no -o BatchMode=yes",
+        };
+        if (ghToken) {
+          gitEnv.GIT_ASKPASS = "echo";
+          gitEnv.GIT_CONFIG_COUNT = "1";
+          gitEnv.GIT_CONFIG_KEY_0 = "url.https://" + ghToken + "@github.com/.insteadOf";
+          gitEnv.GIT_CONFIG_VALUE_0 = "https://github.com/";
+        }
+        const { stdout, stderr } = await execAsync(`git ${operation}${finalArgs ? " " + finalArgs : ""}`, {
           timeout: 60_000, maxBuffer: 1024 * 1024, cwd: projectDir,
-          env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: "ssh -o StrictHostKeyChecking=no -o BatchMode=yes" },
+          env: gitEnv,
         });
         return { result: (stdout + (stderr ? "\n" + stderr : "")).trim() || `git ${operation} completed` };
       } catch (err: any) {
-        return { result: `Git error: ${((err.stdout || "") + (err.stderr || "") || err.message).slice(0, 4000)}` };
+        let errMsg = ((err.stdout || "") + (err.stderr || "") || err.message).slice(0, 4000);
+        errMsg = errMsg.replace(/https:\/\/[^@]+@github\.com/g, "https://***@github.com");
+        return { result: `Git error: ${errMsg}` };
       }
     }
 
@@ -1453,7 +1474,7 @@ Project files: ${fileList}
 - **deploy_ssh**: Deploy to any server via SSH (SFTP upload + remote commands). NOTE: If the user has configured SSH settings, deployment happens automatically when the agent finishes. Use deploy_ssh only for custom/manual deployments.
 
 ### Version Control
-- **git_operation**: Full git operations (init, add, commit, push, pull, branch, etc.)
+- **git_operation**: Full git operations (init, add, commit, push, pull, branch, etc.). GitHub authentication is handled automatically — just use normal https://github.com/ URLs and pushes will work.
 
 ## WORKFLOW — The Luxi Way
 
