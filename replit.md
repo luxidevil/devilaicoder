@@ -91,6 +91,35 @@ The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
 ### Terminal
 WebSocket terminal at `/api/ws/terminal` using node-pty for real shell access.
 
+## Production Deployment
+
+LUXI IDE is deployed on a DigitalOcean VPS at **143.110.189.154**:
+- **Server**: Ubuntu 24.04, 8GB RAM, 154GB disk
+- **Stack**: Node.js 20, pnpm, PostgreSQL 16, nginx, PM2
+- **App path**: `/opt/luxi-ide/`
+- **Database**: `postgres://luxi:***@localhost:5432/luxi_db`
+- **PM2 config**: `/opt/luxi-ide/ecosystem.config.cjs`
+- **Nginx config**: `/etc/nginx/sites-available/luxi-ide`
+- **PM2 auto-starts** on server reboot via `pm2 startup`
+- **Frontend**: Built with Vite, served as static files by Express in production mode
+- **SPA routing**: Express middleware catches all non-API routes and serves `index.html`
+- **WebSocket**: nginx configured with `Upgrade` and `Connection` headers for terminal WS
+- **Express v5 note**: Uses `app.use()` middleware for SPA fallback instead of `app.get("*")` (Express v5 path-to-regexp v8 doesn't support bare `*`)
+
+### Deploy Commands
+```bash
+# SSH into server
+ssh root@143.110.189.154
+# PM2 commands
+pm2 restart luxi-api
+pm2 logs luxi-api
+pm2 list
+# Rebuild on server
+cd /opt/luxi-ide && pnpm --filter @workspace/api-server run build
+PORT=3000 BASE_PATH="/" pnpm --filter @workspace/luxi-ide run build
+pm2 restart luxi-api
+```
+
 ## Key Commands
 
 - `pnpm run typecheck` — full typecheck across all packages

@@ -1,6 +1,7 @@
 import express, { type Express } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
+import path from "path";
 import router from "./routes";
 import { logger } from "./lib/logger";
 
@@ -30,5 +31,14 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 app.use("/api", router);
+
+if (process.env.NODE_ENV === "production") {
+  const feDistPath = path.resolve(__dirname, "../../luxi-ide/dist/public");
+  app.use(express.static(feDistPath));
+  app.use((_req, res, next) => {
+    if (_req.path.startsWith("/api")) return next();
+    res.sendFile(path.join(feDistPath, "index.html"));
+  });
+}
 
 export default app;
