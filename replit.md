@@ -39,10 +39,19 @@ Multi-provider abstraction in `artifacts/api-server/src/lib/ai-providers.ts`:
 - Provider selection and API keys stored in `settings` table
 - Admin panel at `/admin` (credentials: LUXI/LUXI) for configuring provider, model, and API keys
 
+### Agent Filesystem Architecture (CRITICAL)
+Each project has a real filesystem directory at `/home/runner/projects/{projectId}/`.
+- All file operations (write_file, create_file, edit_file, delete_file) dual-write to BOTH the database AND the filesystem
+- All execution tools (run_command, install_package, manage_process) run commands IN the project directory
+- On agent start, all DB files are synced to disk; on agent end, new disk-only files (e.g. package-lock.json) are synced back to DB
+- `read_file` can read from DB, project disk, or absolute paths
+- `list_files` shows both DB files and disk-only files
+- This means the agent can build real apps: write code, install dependencies, start servers, and test them
+
 ### Agent Capabilities (19 tools)
 The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
 - File operations: list, read, write, create, delete, edit, search, find & replace, parse
-- Execution: run_command, install_package (3-min timeout), manage_process, read_logs
+- Execution: run_command (2-min timeout), install_package (3-min timeout), manage_process, read_logs
 - Web: browse_website, web_search, download_file
 - Testing: check_port, test_api
 - Version control: git_operation
