@@ -82,6 +82,7 @@ The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
 - Editor watches `selectedFile.content` + `updatedAt` with `isUserEditingRef`/`userEditTimeRef` to avoid overwriting user edits during agent writes
 - File list polls every 3 seconds for agent-created files
 - Agent panel supports file attachment (drag & drop or click) for HAR/JSON/CSV analysis
+- **Chat persistence**: Conversations and messages are saved to PostgreSQL via `/api/projects/:id/conversations` and `/api/conversations/:id/messages`. On page load, the latest conversation is fetched and chat history is restored. Clearing chat creates a new conversation on next message.
 - Live preview pane: auto-opens when agent's check_port succeeds, shows the running app in an iframe
 - preview_port event: agent emits this when a port check passes → frontend auto-sets URL and opens preview (local mode)
 - preview_url event: agent emits this after SSH auto-deploy → frontend shows the live deployed URL in the preview pane

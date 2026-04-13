@@ -24,8 +24,17 @@ router.post("/projects/:projectId/conversations", async (req, res): Promise<void
   res.status(201).json(conversation);
 });
 
+async function verifyConversation(conversationId: number): Promise<boolean> {
+  const [conv] = await db.select().from(conversationsTable).where(eq(conversationsTable.id, conversationId)).limit(1);
+  return !!conv;
+}
+
 router.get("/conversations/:conversationId/messages", async (req, res): Promise<void> => {
   const conversationId = Number(req.params.conversationId);
+  if (!(await verifyConversation(conversationId))) {
+    res.status(404).json({ error: "Conversation not found" });
+    return;
+  }
   const msgs = await db
     .select()
     .from(messagesTable)
@@ -36,6 +45,10 @@ router.get("/conversations/:conversationId/messages", async (req, res): Promise<
 
 router.post("/conversations/:conversationId/messages", async (req, res): Promise<void> => {
   const conversationId = Number(req.params.conversationId);
+  if (!(await verifyConversation(conversationId))) {
+    res.status(404).json({ error: "Conversation not found" });
+    return;
+  }
   const { role, content } = req.body as { role: string; content: string };
   if (!role || !content) {
     res.status(400).json({ error: "role and content are required" });

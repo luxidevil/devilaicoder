@@ -343,6 +343,87 @@ export default function IDE() {
   const editorRef = useRef<any>(null);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [expandedTools, setExpandedTools] = useState<Set<number>>(new Set());
+  const [conversationId, setConversationId] = useState<number | null>(null);
+  const [chatLoading, setChatLoading] = useState(true);
+  const chatLoadRequestRef = useRef(0);
+
+  useEffect(() => {
+    if (!projectId) return;
+    setAgentEvents([]);
+    setConversationId(null);
+    setChatLoading(true);
+    const requestId = ++chatLoadRequestRef.current;
+    fetch(`/api/projects/${projectId}/conversations`)
+      .then(r => r.json())
+      .then((convos: any[]) => {
+        if (requestId !== chatLoadRequestRef.current) return [];
+        if (convos.length > 0) {
+          const latest = convos[0];
+          setConversationId(latest.id);
+          return fetch(`/api/conversations/${latest.id}/messages`).then(r => r.json());
+        }
+        return [];
+      })
+      .then((msgs: any[]) => {
+        if (requestId !== chatLoadRequestRef.current) return;
+        if (msgs && msgs.length > 0) {
+          const events: AgentEvent[] = [];
+          for (const m of msgs) {
+            if (m.role.startsWith("event:")) {
+              try {
+                events.push(JSON.parse(m.content) as AgentEvent);
+              } catch {}
+            } else {
+              events.push({
+                type: m.role === "user" ? "user" : "message",
+                content: m.content,
+              });
+            }
+          }
+          setAgentEvents(events);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (requestId === chatLoadRequestRef.current) setChatLoading(false);
+      });
+  }, [projectId]);
+
+  const saveMessageToDb = useCallback(async (convId: number, role: string, content: string) => {
+    try {
+      await fetch(`/api/conversations/${convId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role, content }),
+      });
+    } catch {}
+  }, []);
+
+  const saveEventToDb = useCallback(async (convId: number, event: AgentEvent) => {
+    try {
+      await fetch(`/api/conversations/${convId}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: `event:${event.type}`, content: JSON.stringify(event) }),
+      });
+    } catch {}
+  }, []);
+
+  const getOrCreateConversation = useCallback(async (): Promise<number> => {
+    if (conversationId) return conversationId;
+    try {
+      const res = await fetch(`/api/projects/${projectId}/conversations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Chat" }),
+      });
+      const convo = await res.json();
+      setConversationId(convo.id);
+      return convo.id;
+    } catch {
+      return 0;
+    }
+  }, [conversationId, projectId]);
 
   const [showTerminal, setShowTerminal] = useState(false);
   const [terminalMaximized, setTerminalMaximized] = useState(false);
@@ -593,10 +674,14 @@ export default function IDE() {
       content: (e as any).content,
     }));
 
-    setAgentEvents((prev) => [...prev, {
-      type: "user",
-      content: agentInput.trim() + (attachedFiles.length > 0 ? `\n📎 ${attachedFiles.map(f => f.name).join(", ")}` : ""),
-    }]);
+    const displayContent = agentInput.trim() + (attachedFiles.length > 0 ? `\n📎 ${attachedFiles.map(f => f.name).join(", ")}` : "");
+    const userEvent: AgentEvent = { type: "user", content: displayContent };
+    setAgentEvents((prev) => [...prev, userEvent]);
+
+    const convId = await getOrCreateConversation();
+    if (convId) {
+      await saveEventToDb(convId, userEvent);
+    }
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -654,7 +739,9 @@ export default function IDE() {
         }
 
         if (fullMessage) {
-          setAgentEvents((prev) => [...prev, { type: "message", content: fullMessage }]);
+          const msgEvent: AgentEvent = { type: "message", content: fullMessage };
+          setAgentEvents((prev) => [...prev, msgEvent]);
+          if (convId) saveEventToDb(convId, msgEvent);
         }
       } catch (err: any) {
         if (err.name !== "AbortError") {
@@ -689,6 +776,7 @@ export default function IDE() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buf = "";
+      const pendingSaves: Promise<void>[] = [];
 
       while (true) {
         const { done, value } = await reader.read();
@@ -708,6 +796,10 @@ export default function IDE() {
 
               setAgentEvents((prev) => [...prev, event]);
 
+              if (convId) {
+                pendingSaves.push(saveEventToDb(convId, event));
+              }
+
               if (event.type === "file_changed") {
                 queryClient.invalidateQueries({ queryKey: getListFilesQueryKey(projectId) });
               }
@@ -726,6 +818,8 @@ export default function IDE() {
           }
         }
       }
+
+      await Promise.allSettled(pendingSaves);
     } catch (err: any) {
       if (err.name !== "AbortError") {
         setAgentEvents((prev) => [...prev, { type: "error", content: "Connection error" }]);
@@ -1136,7 +1230,12 @@ export default function IDE() {
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <button
-                      onClick={() => { setAgentEvents([]); setExpandedTools(new Set()); }}
+                      onClick={() => {
+                        if (conversationId) {
+                          fetch(`/api/conversations/${conversationId}`, { method: "DELETE" }).catch(() => {});
+                        }
+                        setAgentEvents([]); setExpandedTools(new Set()); setConversationId(null);
+                      }}
                       className="p-1 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
@@ -1149,7 +1248,12 @@ export default function IDE() {
           </div>
 
           <ScrollArea className="flex-1 px-3 py-3">
-            {agentEvents.length === 0 ? (
+            {chatLoading ? (
+              <div className="flex items-center justify-center py-12">
+                <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+                <span className="ml-2 text-sm text-muted-foreground">Loading chat history...</span>
+              </div>
+            ) : agentEvents.length === 0 ? (
               <div className="text-center py-8">
                 <div className="w-14 h-14 rounded-full bg-primary/10 border border-primary/20 flex items-center justify-center mx-auto mb-4">
                   {chatMode === "agent" ? <Bot className="text-primary w-6 h-6" /> : <MessageCircle className="text-primary w-6 h-6" />}
