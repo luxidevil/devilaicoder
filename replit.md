@@ -39,13 +39,24 @@ Multi-provider abstraction in `artifacts/api-server/src/lib/ai-providers.ts`:
 - Provider selection and API keys stored in `settings` table
 - Admin panel at `/admin` (credentials: LUXI/LUXI) for configuring provider, model, and API keys
 
-### Agent Capabilities (18 tools)
+### Agent Capabilities (19 tools)
 The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
 - File operations: list, read, write, create, delete, edit, search, find & replace, parse
-- Execution: run_command, manage_process, read_logs
+- Execution: run_command, install_package (3-min timeout), manage_process, read_logs
 - Web: browse_website, web_search, download_file
 - Testing: check_port, test_api
 - Version control: git_operation
+
+### AI Provider Format Conversions
+- Agent internally uses Gemini's content format (role/parts with functionCall/functionResponse)
+- For Anthropic/OpenAI: `convertContentsToAnthropic` and `convertContentsToOpenAI` generate unique sequential tool call IDs (`call_0`, `call_1`, ...) and use positional matching between model functionCall parts and user functionResponse parts
+- Reasoning models (o3/o4/o1): skip `max_completion_tokens` parameter
+
+### IDE Frontend
+- Agent/Chat mode switcher in the right panel
+- Editor watches `selectedFile.content` + `updatedAt` with `isUserEditingRef`/`userEditTimeRef` to avoid overwriting user edits during agent writes
+- File list polls every 3 seconds for agent-created files
+- Agent panel supports file attachment (drag & drop or click) for HAR/JSON/CSV analysis
 
 ### Terminal
 WebSocket terminal at `/api/ws/terminal` using node-pty for real shell access.

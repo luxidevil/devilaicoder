@@ -14,8 +14,9 @@ const execAsync = promisify(exec);
 
 const router: IRouter = Router();
 
-const MAX_AGENT_ITERATIONS = 40;
-const CMD_TIMEOUT = 30_000;
+const MAX_AGENT_ITERATIONS = 50;
+const CMD_TIMEOUT = 120_000;
+const INSTALL_TIMEOUT = 180_000;
 
 const toolDeclarations: ToolDeclaration[] = [
   {
@@ -39,12 +40,12 @@ const toolDeclarations: ToolDeclaration[] = [
   },
   {
     name: "write_file",
-    description: "Write or overwrite a file with new content. Creates the file if it doesn't exist.",
+    description: "Write or overwrite a file with new content. Creates the file if it doesn't exist. Always write COMPLETE file content — never partial.",
     parameters: {
       type: "OBJECT",
       properties: {
-        path: { type: "STRING", description: "The file path to write" },
-        content: { type: "STRING", description: "The full file content to write" },
+        path: { type: "STRING", description: "The file path to write (e.g. src/index.ts, public/index.html)" },
+        content: { type: "STRING", description: "The COMPLETE file content to write" },
       },
       required: ["path", "content"],
     },
@@ -86,11 +87,24 @@ const toolDeclarations: ToolDeclaration[] = [
   },
   {
     name: "run_command",
-    description: "Execute a shell command and return the output. Use for installing packages, running tests, git operations, building projects, starting servers, etc. Commands run in the user's home directory.",
+    description: "Execute a shell command and return the output. Use for running tests, builds, checking versions, listing directories, etc. For package installs, prefer install_package. Commands run in the user's home directory with a 2-minute timeout.",
     parameters: {
       type: "OBJECT",
       properties: {
         command: { type: "STRING", description: "The shell command to execute" },
+        timeout: { type: "NUMBER", description: "Optional timeout in milliseconds (default: 120000, max: 300000)" },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    name: "install_package",
+    description: "Install packages using npm, pip, or any package manager. Has extended 3-minute timeout for large installs. Always use this instead of run_command for package installations.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        command: { type: "STRING", description: "The full install command, e.g. 'npm install express bcryptjs jsonwebtoken cors' or 'pip install flask'" },
+        cwd: { type: "STRING", description: "Working directory (defaults to home)" },
       },
       required: ["command"],
     },
@@ -173,7 +187,7 @@ const toolDeclarations: ToolDeclaration[] = [
   },
   {
     name: "edit_file",
-    description: "Edit a file by replacing a specific text string with new text. More precise than write_file — only changes the targeted section without rewriting the entire file. Use for small, targeted edits.",
+    description: "Edit a file by replacing a specific text string with new text. More precise than write_file — only changes the targeted section without rewriting the entire file. Use for small, targeted edits. The old_text must match EXACTLY including whitespace and indentation.",
     parameters: {
       type: "OBJECT",
       properties: {
@@ -250,6 +264,10 @@ function getLanguageFromPath(path: string): string {
     py: "python", rs: "rust", go: "go", css: "css", scss: "scss",
     html: "html", json: "json", md: "markdown", sh: "shell",
     yaml: "yaml", yml: "yaml", sql: "sql", toml: "toml",
+    c: "c", cpp: "cpp", h: "c", hpp: "cpp", java: "java",
+    kt: "kotlin", swift: "swift", rb: "ruby", php: "php",
+    vue: "html", svelte: "html", xml: "xml",
+    env: "ini", makefile: "makefile", dockerfile: "dockerfile",
   };
   return map[ext] ?? "plaintext";
 }
@@ -350,8 +368,8 @@ function parseFileContent(
       const vars = content.split("\n")
         .filter((l) => l.trim() && !l.startsWith("#"))
         .map((l) => {
-          const eq = l.indexOf("=");
-          return eq > 0 ? { key: l.slice(0, eq).trim(), value: l.slice(eq + 1).trim().replace(/^["']|["']$/g, "") } : null;
+          const eqIdx = l.indexOf("=");
+          return eqIdx > 0 ? { key: l.slice(0, eqIdx).trim(), value: l.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "") } : null;
         })
         .filter(Boolean);
       return { result: JSON.stringify(vars, null, 2) };
@@ -381,6 +399,7 @@ async function executeTool(
         path: filesTable.path,
         language: filesTable.language,
       }).from(filesTable).where(eq(filesTable.projectId, projectId));
+      if (files.length === 0) return { result: "No files in this project yet. Use write_file or create_file to create files." };
       return { result: JSON.stringify(files, null, 2) };
     }
 
@@ -389,13 +408,16 @@ async function executeTool(
       const files = await db.select().from(filesTable)
         .where(eq(filesTable.projectId, projectId));
       const file = files.find((f) => f.path === path || f.name === path);
-      if (!file) return { result: `Error: File "${path}" not found in project` };
+      if (!file) return { result: `Error: File "${path}" not found in project. Available files: ${files.map(f => f.path).join(", ") || "none"}` };
       return { result: file.content };
     }
 
     case "write_file": {
       const path = args.path as string;
       const content = args.content as string;
+      if (!content && content !== "") {
+        return { result: "Error: content is required for write_file" };
+      }
       const files = await db.select().from(filesTable)
         .where(eq(filesTable.projectId, projectId));
       const existing = files.find((f) => f.path === path || f.name === path);
@@ -485,6 +507,7 @@ async function executeTool(
 
     case "run_command": {
       const command = args.command as string;
+      const customTimeout = Math.min(Number(args.timeout) || CMD_TIMEOUT, 300_000);
       const blocked = [
         "rm -rf /", "rm -rf /*", "rm -rf ~", "rm -rf $HOME",
         ":(){ :|:& };:", "mkfs", "dd if=", "chmod -R 777 /",
@@ -499,17 +522,50 @@ async function executeTool(
       }
       try {
         const { stdout, stderr } = await execAsync(command, {
-          timeout: CMD_TIMEOUT,
-          maxBuffer: 1024 * 1024,
+          timeout: customTimeout,
+          maxBuffer: 2 * 1024 * 1024,
           cwd: process.env.HOME || "/home/runner",
-          env: { ...process.env, NODE_ENV: "development" },
+          env: { ...process.env, NODE_ENV: "development", FORCE_COLOR: "0" },
         });
         const output = (stdout + (stderr ? "\nSTDERR:\n" + stderr : "")).trim();
         return { result: output || "(no output)" };
       } catch (err: any) {
         const output = (err.stdout || "") + (err.stderr ? "\nSTDERR:\n" + err.stderr : "");
+        if (err.killed) {
+          return { result: `Command timed out after ${customTimeout / 1000}s. Output so far:\n${(output || "").slice(0, 4000)}` };
+        }
         return {
           result: `Command failed (exit ${err.code ?? "?"}): ${(output || err.message || "").slice(0, 4000)}`,
+        };
+      }
+    }
+
+    case "install_package": {
+      const command = args.command as string;
+      const cwd = args.cwd as string || process.env.HOME || "/home/runner";
+      if (!command) return { result: "Error: command is required" };
+      try {
+        const { stdout, stderr } = await execAsync(command, {
+          timeout: INSTALL_TIMEOUT,
+          maxBuffer: 4 * 1024 * 1024,
+          cwd,
+          env: { ...process.env, NODE_ENV: "development", FORCE_COLOR: "0", CI: "true" },
+        });
+        const output = (stdout + (stderr ? "\n" + stderr : "")).trim();
+        const lines = output.split("\n");
+        const relevantLines = lines.filter(l =>
+          l.includes("added") || l.includes("removed") || l.includes("changed") ||
+          l.includes("up to date") || l.includes("Successfully installed") ||
+          l.includes("ERROR") || l.includes("error") || l.includes("WARN") ||
+          l.includes("npm warn") || l.includes("packages in") ||
+          l.trim() === ""
+        );
+        const summary = relevantLines.length > 0 ? relevantLines.join("\n") : output.slice(-2000);
+        return { result: summary || "Package install completed successfully" };
+      } catch (err: any) {
+        const output = (err.stdout || "") + (err.stderr ? "\n" + err.stderr : "");
+        return {
+          result: `Install failed (exit ${err.code ?? "?"}): ${(output || err.message || "").slice(0, 4000)}\n\nTry checking the package name or your internet connection.`,
         };
       }
     }
@@ -610,14 +666,14 @@ async function executeTool(
           const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
 
           if (titleMatch && urlMatch) {
-            let url = urlMatch[1];
-            if (url.includes("uddg=")) {
-              const decoded = decodeURIComponent(url.split("uddg=")[1]?.split("&")[0] ?? "");
-              if (decoded) url = decoded;
+            let resultUrl = urlMatch[1];
+            if (resultUrl.includes("uddg=")) {
+              const decoded = decodeURIComponent(resultUrl.split("uddg=")[1]?.split("&")[0] ?? "");
+              if (decoded) resultUrl = decoded;
             }
             results.push({
               title: titleMatch[1].replace(/<[^>]+>/g, "").trim(),
-              url,
+              url: resultUrl,
               snippet: snippetMatch
                 ? snippetMatch[1].replace(/<[^>]+>/g, "").trim()
                 : "",
@@ -770,7 +826,12 @@ async function executeTool(
           });
 
           managedProcesses.set(name, { proc, output });
-          return { result: `Process "${name}" started (PID: ${proc.pid}): ${command}` };
+
+          await new Promise(resolve => setTimeout(resolve, 1500));
+          const startOutput = output.slice(-10).join("\n");
+          return {
+            result: `Process "${name}" started (PID: ${proc.pid}): ${command}\n\nInitial output:\n${startOutput || "(waiting for output...)"}`,
+          };
         }
 
         case "stop": {
@@ -824,7 +885,36 @@ async function executeTool(
       if (!file) return { result: `Error: File "${path}" not found` };
 
       if (!file.content.includes(oldText)) {
-        return { result: `Error: Could not find the exact text to replace in "${path}". Make sure old_text matches exactly (including whitespace).` };
+        const normalizedContent = file.content.replace(/\r\n/g, "\n");
+        const normalizedOld = oldText.replace(/\r\n/g, "\n");
+        if (normalizedContent.includes(normalizedOld)) {
+          const newContent = normalizedContent.replace(normalizedOld, newText);
+          await db.update(filesTable)
+            .set({ content: newContent, updatedAt: new Date() })
+            .where(eq(filesTable.id, file.id));
+          return {
+            result: `Edited "${path}": replaced 1 occurrence (normalized line endings)`,
+            fileChanged: { path, action: "updated" },
+          };
+        }
+
+        const trimmedContent = file.content.split("\n").map(l => l.trimEnd()).join("\n");
+        const trimmedOld = oldText.split("\n").map(l => l.trimEnd()).join("\n");
+        if (trimmedContent.includes(trimmedOld)) {
+          const newContent = trimmedContent.replace(trimmedOld, newText);
+          await db.update(filesTable)
+            .set({ content: newContent, updatedAt: new Date() })
+            .where(eq(filesTable.id, file.id));
+          return {
+            result: `Edited "${path}": replaced 1 occurrence (normalized trailing whitespace)`,
+            fileChanged: { path, action: "updated" },
+          };
+        }
+
+        const preview = file.content.slice(0, 500);
+        return {
+          result: `Error: Could not find the exact text to replace in "${path}". Make sure old_text matches exactly (including whitespace and indentation).\n\nFile preview:\n${preview}`,
+        };
       }
 
       const occurrences = file.content.split(oldText).length - 1;
@@ -835,7 +925,7 @@ async function executeTool(
         .where(eq(filesTable.id, file.id));
 
       return {
-        result: `Edited "${path}": replaced ${occurrences} occurrence(s) (${oldText.length} → ${newText.length} chars)`,
+        result: `Edited "${path}": replaced ${occurrences} occurrence(s) (${oldText.length} -> ${newText.length} chars)`,
         fileChanged: { path, action: "updated" },
       };
     }
@@ -980,7 +1070,7 @@ async function executeTool(
 
         const elapsed = Date.now() - start;
         const bodyText = await resp.text().catch(() => "");
-        
+
         const tests: { name: string; pass: boolean; detail: string }[] = [];
 
         tests.push({
@@ -1091,7 +1181,9 @@ router.post("/ai/agent", async (req, res): Promise<void> => {
 
   const sendEvent = (event: Record<string, any>) => {
     if (!aborted) {
-      res.write(`data: ${JSON.stringify(event)}\n\n`);
+      try {
+        res.write(`data: ${JSON.stringify(event)}\n\n`);
+      } catch {}
     }
   };
 
@@ -1101,63 +1193,84 @@ router.post("/ai/agent", async (req, res): Promise<void> => {
       path: filesTable.path,
     }).from(filesTable).where(eq(filesTable.projectId, projectId));
 
-    const fileList = projectFiles.map((f) => f.path).join(", ") || "No files yet";
+    const fileList = projectFiles.map((f) => f.path).join(", ") || "No files yet — this is an empty project";
 
-    const systemPrompt = `You are Luxi — an elite autonomous AI coding agent, as powerful as Replit's AI agent. You can do ANYTHING a software developer can do: read/write/edit files, run any shell command, browse websites, search the web, manage git repos, download files, start/stop processes, read logs, parse data files, test APIs, and debug applications — completely autonomously.
+    const systemPrompt = `You are Luxi — an elite autonomous AI coding agent, as powerful as the best AI coding assistants in the world. You can do ANYTHING a software developer can do: read/write/edit files, run any shell command, browse websites, search the web, manage git repos, download files, start/stop processes, read logs, parse data files, test APIs, and debug applications — completely autonomously.
 
 CURRENT PROJECT FILES: ${fileList}
 
-YOUR COMPLETE TOOLSET (18 tools):
+YOUR COMPLETE TOOLSET (19 tools):
 
 FILE OPERATIONS:
 - list_files: See all files in the project
 - read_file(path): Read a file's contents
-- write_file(path, content): Write/overwrite a file with full content
+- write_file(path, content): Write/overwrite a file with COMPLETE content
 - create_file(name, path, content): Create a new file
 - delete_file(path): Delete a file
-- edit_file(path, old_text, new_text): Surgically edit a specific part of a file
+- edit_file(path, old_text, new_text): Surgically edit a specific part of a file (old_text must match EXACTLY)
 - search_files(query): Search filenames and content
 - find_and_replace(pattern, replacement, file_pattern): Regex find & replace across files
 - parse_file(path, format, extract): Parse HAR/JSON/CSV/XML/YAML/.env files
 
 EXECUTION:
-- run_command(command): Run ANY shell command (30s timeout)
+- run_command(command): Run ANY shell command (2 min timeout)
+- install_package(command): Install packages with extended 3-min timeout (e.g. "npm install express bcryptjs")
 - manage_process(action, command, name): Start/stop/monitor background processes
 - read_logs(source, lines, filter): Read log files or process output
 
 WEB & NETWORK:
-- browse_website(url, method, headers, body): Fetch any URL
-- web_search(query): Search the web
+- browse_website(url, method, headers, body): Fetch any URL, read docs, check APIs
+- web_search(query): Search the web for documentation, solutions, etc.
 - download_file(url, destination): Download files from the internet
 
 TESTING & DEBUGGING:
-- check_port(port, path, method, expectedStatus): Check if a service is running
-- test_api(url, method, headers, body, expect_status, expect_body_contains, expect_json_path): Full API testing
+- check_port(port, path): Check if a service is running on a port
+- test_api(url, method, headers, body, expect_status): Full API testing with assertions
 
 VERSION CONTROL:
-- git_operation(operation, args, cwd): Full git operations
+- git_operation(operation, args, cwd): Full git operations (clone, commit, push, etc.)
 
-WORKFLOW — Follow this for EVERY task:
-1. UNDERSTAND: Read the request carefully. Parse uploaded files with parse_file.
-2. INVESTIGATE: Read existing files, search the codebase, check dependencies.
-3. PLAN: Think about changes needed. Consider edge cases and dependencies.
-4. IMPLEMENT: Write complete, production-quality code.
-5. INSTALL: Run package installs or builds needed.
-6. VERIFY: Run the code, check for errors, use check_port and test_api.
-7. ITERATE: If anything fails, fix it and try again. Repeat until it works.
-8. SUMMARIZE: Explain what you did and what changed.
+MASTER WORKFLOW — Follow this for EVERY task:
 
-CRITICAL RETRY BEHAVIOR:
-- NEVER give up after a single failure.
-- You have 40 iterations — USE THEM until the task is 100% complete.
-- Read errors carefully, fix the specific issue, verify the fix worked.
+1. UNDERSTAND: Read the request carefully. If the user attached files, parse them.
+2. INVESTIGATE: List existing files, read relevant ones, understand the codebase.
+3. PLAN: Think step-by-step. For complex tasks (like "build a website with login"):
+   - List ALL files you need to create
+   - Identify ALL dependencies to install
+   - Plan the architecture BEFORE writing code
+4. IMPLEMENT: Write COMPLETE, PRODUCTION-READY code. NEVER use placeholder comments like "// TODO" or "// add your logic here". Every file must be 100% complete.
+5. INSTALL DEPENDENCIES: Use install_package for npm/pip installs. ALWAYS install before running.
+6. VERIFY: Run the code, check for errors. Start the server and use check_port to verify it works.
+7. TEST: Use test_api to verify endpoints work correctly.
+8. FIX: If ANYTHING fails, read the error carefully, fix the code, and try again.
+9. SUMMARIZE: Tell the user exactly what you built, what files you created, and how to use it.
 
-RULES:
-- Always read files before modifying them
-- Write COMPLETE files — never partial snippets, placeholders, or TODO comments
-- Install dependencies when adding new packages
-- Use edit_file for small targeted changes instead of rewriting entire files
-- NEVER say "I can't do this" — you have ALL the tools you need`;
+CRITICAL RULES:
+
+1. NEVER give up after a single failure. You have ${MAX_AGENT_ITERATIONS} iterations — use them until the task is 100% complete.
+2. ALWAYS write COMPLETE files. Never write partial code, never use "..." or "// rest of code here".
+3. When building web apps:
+   - Create ALL files: HTML, CSS, JS, backend code, package.json
+   - Install ALL dependencies before running
+   - Use proper error handling, input validation, and security practices
+   - For login systems: hash passwords with bcrypt, use JWT or sessions, validate inputs
+4. Read files before modifying them — understand what exists first.
+5. Use edit_file for small targeted changes, write_file for creating or fully rewriting files.
+6. NEVER say "I can't do this" — you have ALL the tools you need to accomplish anything.
+7. When a command fails, READ THE ERROR and fix the underlying issue. Don't just retry.
+8. For Node.js projects: always create a proper package.json first, then install dependencies.
+9. Start dev servers with manage_process so they run in the background.
+10. After starting a server, wait and use check_port to verify it's running.
+
+EXAMPLE: Building a login system
+1. Create package.json with dependencies
+2. install_package("npm install express bcryptjs jsonwebtoken cors body-parser")
+3. Create server.js with Express routes for /register, /login, /profile
+4. Create public/index.html with login/register forms
+5. Create public/style.css for styling
+6. Create public/app.js for frontend JavaScript
+7. Start server with manage_process
+8. Verify with check_port and test_api`;
 
     const chatHistory: any[] = (history ?? []).slice(-20).map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
@@ -1169,34 +1282,76 @@ RULES:
       { role: "user", parts: [{ text: message }] },
     ];
 
+    let emptyResponseCount = 0;
+
     for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
       if (aborted) break;
 
       activeAbort = new AbortController();
-      const agentResult = await agentCall(
-        settings,
-        systemPrompt,
-        contents,
-        toolDeclarations,
-        activeAbort.signal
-      );
+      let agentResult;
+      try {
+        agentResult = await agentCall(
+          settings,
+          systemPrompt,
+          contents,
+          toolDeclarations,
+          activeAbort.signal
+        );
+      } catch (err: any) {
+        if (err.name === "AbortError" || aborted) break;
+        logger.error({ err }, "Agent call error");
+        sendEvent({ type: "error", content: `AI call failed: ${err.message}. Retrying...` });
+        emptyResponseCount++;
+        if (emptyResponseCount >= 3) {
+          sendEvent({ type: "error", content: "Multiple AI call failures. Please check your API key and try again." });
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        continue;
+      }
       activeAbort = null;
 
       if (agentResult.finishReason?.startsWith("error:")) {
         logger.error({ reason: agentResult.finishReason }, "AI API error in agent");
-        sendEvent({ type: "error", content: `AI error: ${agentResult.finishReason}` });
+        const errorDetail = agentResult.finishReason.slice(6);
+        if (errorDetail.includes("429") || errorDetail.includes("rate")) {
+          sendEvent({ type: "thinking", content: "Rate limited. Waiting before retrying..." });
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          emptyResponseCount++;
+          if (emptyResponseCount >= 3) {
+            sendEvent({ type: "error", content: "Rate limited too many times. Please wait and try again." });
+            break;
+          }
+          continue;
+        }
+        sendEvent({ type: "error", content: `AI error: ${errorDetail}` });
         break;
       }
 
       if (agentResult.finishReason === "no_content") {
-        sendEvent({ type: "error", content: "No response from AI" });
-        break;
+        emptyResponseCount++;
+        if (emptyResponseCount >= 3) {
+          sendEvent({ type: "error", content: "No response from AI after multiple attempts." });
+          break;
+        }
+        continue;
       }
+
+      emptyResponseCount = 0;
 
       if (agentResult.textParts.length > 0 && agentResult.toolCalls.length === 0) {
         const fullText = agentResult.textParts.join("");
         sendEvent({ type: "message", content: fullText });
         break;
+      }
+
+      if (agentResult.toolCalls.length === 0 && agentResult.textParts.length === 0) {
+        emptyResponseCount++;
+        if (emptyResponseCount >= 3) {
+          sendEvent({ type: "message", content: "Task completed." });
+          break;
+        }
+        continue;
       }
 
       if (agentResult.toolCalls.length > 0) {
@@ -1209,9 +1364,14 @@ RULES:
         }
         contents.push({ role: "model", parts: modelParts });
 
+        if (agentResult.textParts.length > 0) {
+          sendEvent({ type: "thinking", content: agentResult.textParts.join("") });
+        }
+
         const functionResponses: any[] = [];
 
         for (const tc of agentResult.toolCalls) {
+          if (aborted) break;
           const callId = `tc_${toolCallCounter++}`;
 
           sendEvent({
@@ -1224,13 +1384,13 @@ RULES:
           });
 
           const { result, fileChanged } = await executeTool(tc.name, tc.args, projectId);
-          const truncatedResult = result.length > 10000 ? result.slice(0, 10000) + "\n...(truncated)" : result;
+          const truncatedResult = result.length > 15000 ? result.slice(0, 15000) + "\n...(truncated)" : result;
 
           sendEvent({
             type: "tool_result",
             id: callId,
             tool: tc.name,
-            result: truncatedResult.length > 500 ? truncatedResult.slice(0, 500) + "..." : truncatedResult,
+            result: truncatedResult.length > 800 ? truncatedResult.slice(0, 800) + "..." : truncatedResult,
           });
 
           if (fileChanged) {
@@ -1246,10 +1406,6 @@ RULES:
         }
 
         contents.push({ role: "user", parts: functionResponses });
-
-        if (agentResult.textParts.length > 0) {
-          sendEvent({ type: "thinking", content: agentResult.textParts.join("") });
-        }
       }
 
       if ((agentResult.finishReason === "STOP" || agentResult.finishReason === "end_turn" || agentResult.finishReason === "stop") && agentResult.toolCalls.length === 0) {

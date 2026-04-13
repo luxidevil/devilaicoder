@@ -109,13 +109,15 @@ function geminiToolFormat(tools: ToolDeclaration[]) {
     name: t.name,
     description: t.description,
     parameters: {
-      type: "OBJECT" as const,
-      properties: Object.fromEntries(
-        Object.entries(t.parameters.properties).map(([k, v]) => [
-          k,
-          { type: v.type.toUpperCase(), description: v.description },
-        ])
-      ),
+      type: "OBJECT",
+      properties: Object.keys(t.parameters.properties).length === 0
+        ? undefined
+        : Object.fromEntries(
+            Object.entries(t.parameters.properties).map(([k, v]) => [
+              k,
+              { type: v.type.toUpperCase(), description: v.description },
+            ])
+          ),
       required: t.parameters.required,
     },
   }));
@@ -212,13 +214,23 @@ async function streamGeminiChat(
 
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
+  let buffer = "";
 
   return new ReadableStream({
     async pull(controller) {
-      let buffer = "";
-      while (true) {
+      try {
         const { done, value } = await reader.read();
         if (done) {
+          if (buffer.trim()) {
+            const line = buffer.trim();
+            if (line.startsWith("data: ")) {
+              try {
+                const parsed = JSON.parse(line.slice(6));
+                const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (text) controller.enqueue({ text });
+              } catch {}
+            }
+          }
           controller.enqueue({ done: true });
           controller.close();
           return;
@@ -237,6 +249,10 @@ async function streamGeminiChat(
             } catch {}
           }
         }
+      } catch (err: any) {
+        controller.enqueue({ error: err.message ?? "Stream read error" });
+        controller.enqueue({ done: true });
+        controller.close();
       }
     },
   });
@@ -283,11 +299,11 @@ async function streamAnthropicChat(
 
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
+  let buffer = "";
 
   return new ReadableStream({
     async pull(controller) {
-      let buffer = "";
-      while (true) {
+      try {
         const { done, value } = await reader.read();
         if (done) {
           controller.enqueue({ done: true });
@@ -314,6 +330,10 @@ async function streamAnthropicChat(
             } catch {}
           }
         }
+      } catch (err: any) {
+        controller.enqueue({ error: err.message ?? "Stream read error" });
+        controller.enqueue({ done: true });
+        controller.close();
       }
     },
   });
@@ -333,6 +353,17 @@ async function streamOpenAIChat(
     })),
   ];
 
+  const isReasoningModel = settings.model.startsWith("o3") || settings.model.startsWith("o4") || settings.model.startsWith("o1");
+
+  const body: any = {
+    model: settings.model,
+    messages: oaiMessages,
+    stream: true,
+  };
+  if (!isReasoningModel) {
+    body.max_completion_tokens = 16384;
+  }
+
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -340,12 +371,7 @@ async function streamOpenAIChat(
       Authorization: `Bearer ${settings.apiKey}`,
     },
     signal,
-    body: JSON.stringify({
-      model: settings.model,
-      messages: oaiMessages,
-      stream: true,
-      max_completion_tokens: 16384,
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -361,11 +387,11 @@ async function streamOpenAIChat(
 
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
+  let buffer = "";
 
   return new ReadableStream({
     async pull(controller) {
-      let buffer = "";
-      while (true) {
+      try {
         const { done, value } = await reader.read();
         if (done) {
           controller.enqueue({ done: true });
@@ -386,6 +412,10 @@ async function streamOpenAIChat(
             } catch {}
           }
         }
+      } catch (err: any) {
+        controller.enqueue({ error: err.message ?? "Stream read error" });
+        controller.enqueue({ done: true });
+        controller.close();
       }
     },
   });
@@ -415,6 +445,18 @@ async function agentCallGemini(
   tools: ToolDeclaration[],
   signal?: AbortSignal
 ): Promise<AgentResponse> {
+  const geminiTools = geminiToolFormat(tools);
+  const cleanedTools = geminiTools.map(t => {
+    const params: any = { type: "OBJECT" };
+    if (t.parameters.properties && Object.keys(t.parameters.properties).length > 0) {
+      params.properties = t.parameters.properties;
+    }
+    if (t.parameters.required && t.parameters.required.length > 0) {
+      params.required = t.parameters.required;
+    }
+    return { name: t.name, description: t.description, parameters: params };
+  });
+
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${settings.model}:generateContent?key=${settings.apiKey}`,
     {
@@ -424,7 +466,7 @@ async function agentCallGemini(
       body: JSON.stringify({
         system_instruction: { parts: [{ text: systemPrompt }] },
         contents,
-        tools: [{ functionDeclarations: geminiToolFormat(tools) }],
+        tools: [{ functionDeclarations: cleanedTools }],
         tool_config: { function_calling_config: { mode: "AUTO" } },
         generationConfig: { maxOutputTokens: 65536, temperature: 0.2 },
       }),
@@ -528,28 +570,35 @@ async function agentCallAnthropic(
 
 function convertContentsToAnthropic(contents: any[]): any[] {
   const messages: any[] = [];
+  let idCounter = 0;
+  let lastModelCallIds: string[] = [];
 
   for (const c of contents) {
     if (c.role === "user") {
       if (c.parts?.[0]?.functionResponse) {
-        const toolResults = c.parts.map((p: any) => ({
+        const toolResults = c.parts.map((p: any, idx: number) => ({
           type: "tool_result",
-          tool_use_id: p.functionResponse.name + "_call",
-          content: p.functionResponse.response.result,
+          tool_use_id: lastModelCallIds[idx] ?? `call_${idCounter++}`,
+          content: typeof p.functionResponse.response?.result === "string"
+            ? p.functionResponse.response.result
+            : JSON.stringify(p.functionResponse.response),
         }));
         messages.push({ role: "user", content: toolResults });
       } else {
-        const text = c.parts?.map((p: any) => p.text).join("") ?? c.content ?? "";
-        messages.push({ role: "user", content: text });
+        const text = c.parts?.map((p: any) => p.text).filter(Boolean).join("") ?? c.content ?? "";
+        if (text) messages.push({ role: "user", content: text });
       }
     } else if (c.role === "model" || c.role === "assistant") {
       const content: any[] = [];
+      lastModelCallIds = [];
       for (const p of c.parts ?? []) {
         if (p.text) content.push({ type: "text", text: p.text });
         if (p.functionCall) {
+          const callId = `call_${idCounter++}`;
+          lastModelCallIds.push(callId);
           content.push({
             type: "tool_use",
-            id: p.functionCall.name + "_call",
+            id: callId,
             name: p.functionCall.name,
             input: p.functionCall.args ?? {},
           });
@@ -571,6 +620,17 @@ async function agentCallOpenAI(
 ): Promise<AgentResponse> {
   const messages = convertContentsToOpenAI(contents, systemPrompt);
 
+  const isReasoningModel = settings.model.startsWith("o3") || settings.model.startsWith("o4") || settings.model.startsWith("o1");
+  const body: any = {
+    model: settings.model,
+    messages,
+    tools: openaiToolFormat(tools),
+    tool_choice: "auto",
+  };
+  if (!isReasoningModel) {
+    body.max_completion_tokens = 16384;
+  }
+
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -578,13 +638,7 @@ async function agentCallOpenAI(
       Authorization: `Bearer ${settings.apiKey}`,
     },
     signal,
-    body: JSON.stringify({
-      model: settings.model,
-      messages,
-      tools: openaiToolFormat(tools),
-      tool_choice: "auto",
-      max_completion_tokens: 16384,
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -617,36 +671,47 @@ async function agentCallOpenAI(
 
 function convertContentsToOpenAI(contents: any[], systemPrompt: string): any[] {
   const messages: any[] = [{ role: "system", content: systemPrompt }];
+  let idCounter = 0;
+  let lastModelCallIds: string[] = [];
 
   for (const c of contents) {
     if (c.role === "user") {
       if (c.parts?.[0]?.functionResponse) {
-        for (const p of c.parts) {
+        for (let i = 0; i < c.parts.length; i++) {
+          const p = c.parts[i];
           messages.push({
             role: "tool",
-            tool_call_id: p.functionResponse.name + "_call",
-            content: p.functionResponse.response.result,
+            tool_call_id: lastModelCallIds[i] ?? `call_${idCounter++}`,
+            content: typeof p.functionResponse.response?.result === "string"
+              ? p.functionResponse.response.result
+              : JSON.stringify(p.functionResponse.response),
           });
         }
       } else {
-        const text = c.parts?.map((p: any) => p.text).join("") ?? c.content ?? "";
-        messages.push({ role: "user", content: text });
+        const text = c.parts?.map((p: any) => p.text).filter(Boolean).join("") ?? c.content ?? "";
+        if (text) messages.push({ role: "user", content: text });
       }
     } else if (c.role === "model" || c.role === "assistant") {
       const textContent = c.parts?.filter((p: any) => p.text).map((p: any) => p.text).join("") ?? "";
       const toolCallParts = c.parts?.filter((p: any) => p.functionCall) ?? [];
 
+      lastModelCallIds = [];
       const msg: any = { role: "assistant" };
       if (textContent) msg.content = textContent;
+      else msg.content = null;
       if (toolCallParts.length > 0) {
-        msg.tool_calls = toolCallParts.map((p: any) => ({
-          id: p.functionCall.name + "_call",
-          type: "function",
-          function: {
-            name: p.functionCall.name,
-            arguments: JSON.stringify(p.functionCall.args ?? {}),
-          },
-        }));
+        msg.tool_calls = toolCallParts.map((p: any) => {
+          const callId = `call_${idCounter++}`;
+          lastModelCallIds.push(callId);
+          return {
+            id: callId,
+            type: "function",
+            function: {
+              name: p.functionCall.name,
+              arguments: JSON.stringify(p.functionCall.args ?? {}),
+            },
+          };
+        });
       }
       messages.push(msg);
     }

@@ -45,6 +45,8 @@ import {
   Paperclip,
   X,
   Upload,
+  MessageCircle,
+  Cpu,
 } from "lucide-react";
 import { Link } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
@@ -105,6 +107,7 @@ function getToolIcon(tool: string) {
     case "list_files": return <FolderOpen className="w-3 h-3" />;
     case "search_files": return <Search className="w-3 h-3" />;
     case "run_command": return <Terminal className="w-3 h-3" />;
+    case "install_package": return <Play className="w-3 h-3" />;
     case "browse_website": return <Globe className="w-3 h-3" />;
     case "web_search": return <Search className="w-3 h-3" />;
     case "git_operation": return <Zap className="w-3 h-3" />;
@@ -129,6 +132,7 @@ function getToolLabel(tool: string) {
     case "list_files": return "Listing files";
     case "search_files": return "Searching files";
     case "run_command": return "Running command";
+    case "install_package": return "Installing packages";
     case "browse_website": return "Browsing website";
     case "web_search": return "Searching the web";
     case "git_operation": return "Git operation";
@@ -155,7 +159,7 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "border-green-500/30 bg-green-500/5"
     : tool === "delete_file"
     ? "border-red-500/30 bg-red-500/5"
-    : tool === "run_command" || tool === "manage_process"
+    : tool === "run_command" || tool === "manage_process" || tool === "install_package"
     ? "border-yellow-500/30 bg-yellow-500/5"
     : tool === "browse_website" || tool === "web_search" || tool === "download_file"
     ? "border-purple-500/30 bg-purple-500/5"
@@ -173,7 +177,7 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "text-green-400"
     : tool === "delete_file"
     ? "text-red-400"
-    : tool === "run_command" || tool === "manage_process"
+    : tool === "run_command" || tool === "manage_process" || tool === "install_package"
     ? "text-yellow-400"
     : tool === "browse_website" || tool === "web_search" || tool === "download_file"
     ? "text-purple-400"
@@ -255,6 +259,8 @@ function MarkdownContent({ content }: { content: string }) {
   );
 }
 
+type ChatMode = "agent" | "chat";
+
 export default function IDE() {
   const params = useParams<{ id: string }>();
   const projectId = Number(params.id);
@@ -265,7 +271,11 @@ export default function IDE() {
     query: { enabled: !!projectId, queryKey: getGetProjectQueryKey(projectId) },
   });
   const { data: files, isLoading: filesLoading } = useListFiles(projectId, {
-    query: { enabled: !!projectId, queryKey: getListFilesQueryKey(projectId) },
+    query: {
+      enabled: !!projectId,
+      queryKey: getListFilesQueryKey(projectId),
+      refetchInterval: 3000,
+    },
   });
 
   const createFile = useCreateFile();
@@ -277,6 +287,8 @@ export default function IDE() {
   const [isSaving, setIsSaving] = useState(false);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSavedRef = useRef<string>("");
+  const isUserEditingRef = useRef(false);
+  const userEditTimeRef = useRef(0);
 
   const [newFileName, setNewFileName] = useState("");
   const [showNewFileDialog, setShowNewFileDialog] = useState(false);
@@ -302,20 +314,29 @@ export default function IDE() {
   const [showPreview, setShowPreview] = useState(false);
   const [previewUrl, setPreviewUrl] = useState("");
 
+  const [chatMode, setChatMode] = useState<ChatMode>("agent");
+
   const selectedFile = files?.find((f) => f.id === selectedFileId);
 
   useEffect(() => {
     if (files && files.length > 0 && !selectedFileId) {
       setSelectedFileId(files[0].id);
     }
-  }, [files]);
+  }, [files, selectedFileId]);
 
   useEffect(() => {
     if (selectedFile) {
-      setEditorContent(selectedFile.content);
-      lastSavedRef.current = selectedFile.content;
+      const timeSinceEdit = Date.now() - userEditTimeRef.current;
+      const userRecentlyEdited = isUserEditingRef.current || timeSinceEdit < 2000;
+
+      if (!userRecentlyEdited || editorContent === lastSavedRef.current) {
+        if (selectedFile.content !== editorContent) {
+          setEditorContent(selectedFile.content);
+          lastSavedRef.current = selectedFile.content;
+        }
+      }
     }
-  }, [selectedFile?.id]);
+  }, [selectedFile?.id, selectedFile?.content, selectedFile?.updatedAt]);
 
   useEffect(() => {
     agentBottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -373,6 +394,8 @@ export default function IDE() {
     (value: string | undefined) => {
       const newContent = value ?? "";
       setEditorContent(newContent);
+      isUserEditingRef.current = true;
+      userEditTimeRef.current = Date.now();
 
       if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
       if (!selectedFileId) return;
@@ -380,6 +403,7 @@ export default function IDE() {
       setIsSaving(true);
       saveTimeoutRef.current = setTimeout(() => {
         flushSave(newContent);
+        isUserEditingRef.current = false;
       }, 800);
     },
     [selectedFileId, flushSave]
@@ -494,6 +518,72 @@ export default function IDE() {
 
     const controller = new AbortController();
     abortRef.current = controller;
+
+    if (chatMode === "chat") {
+      try {
+        const response = await fetch("/api/ai/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: userMessage,
+            projectId,
+            history: history.slice(-20),
+            mode: "message",
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          const errData = await response.json().catch(() => ({ error: "Chat not available" }));
+          setAgentEvents((prev) => [...prev, { type: "error", content: errData.error ?? "Something went wrong" }]);
+          setIsAgentRunning(false);
+          return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let fullMessage = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              const data = line.slice(6).trim();
+              if (!data) continue;
+              try {
+                const event = JSON.parse(data);
+                if (event.done) continue;
+                if (event.content) {
+                  fullMessage += event.content;
+                }
+                if (event.error) {
+                  setAgentEvents((prev) => [...prev, { type: "error", content: event.error }]);
+                }
+              } catch {}
+            }
+          }
+        }
+
+        if (fullMessage) {
+          setAgentEvents((prev) => [...prev, { type: "message", content: fullMessage }]);
+        }
+      } catch (err: any) {
+        if (err.name !== "AbortError") {
+          setAgentEvents((prev) => [...prev, { type: "error", content: "Connection error" }]);
+        }
+      }
+
+      setIsAgentRunning(false);
+      abortRef.current = null;
+      return;
+    }
 
     try {
       const response = await fetch("/api/ai/agent", {
@@ -696,7 +786,10 @@ export default function IDE() {
                       "flex items-center justify-between px-3 py-1.5 group cursor-pointer hover:bg-muted/50 transition-colors",
                       selectedFileId === file.id && "bg-primary/10 border-r-2 border-primary"
                     )}
-                    onClick={() => setSelectedFileId(file.id)}
+                    onClick={() => {
+                      isUserEditingRef.current = false;
+                      setSelectedFileId(file.id);
+                    }}
                     data-testid={`file-item-${file.id}`}
                   >
                     <div className="flex items-center gap-2 min-w-0">
@@ -790,7 +883,7 @@ export default function IDE() {
                         <File className="w-8 h-8 text-muted-foreground" />
                       </div>
                       <h3 className="text-sm font-medium text-muted-foreground mb-2">No file selected</h3>
-                      <p className="text-xs text-muted-foreground/60 mb-4">Select a file from the sidebar or create a new one.</p>
+                      <p className="text-xs text-muted-foreground/60 mb-4">Select a file from the sidebar or ask the agent to build something.</p>
                       <Button size="sm" variant="outline" onClick={() => setShowNewFileDialog(true)} className="text-xs">
                         <FilePlus className="w-3 h-3 mr-1" />
                         New file
@@ -847,10 +940,31 @@ export default function IDE() {
 
         <Panel defaultSize={34} minSize={24} maxSize={55} className="flex flex-col overflow-hidden border-l border-border bg-card">
           <div className="flex items-center justify-between px-3 py-2 border-b border-border flex-shrink-0">
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
-              <span className="text-xs font-semibold text-foreground">Luxi Agent</span>
-              <span className="text-[10px] text-primary/60 font-mono">autonomous</span>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setChatMode("agent")}
+                className={cn(
+                  "flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium transition-colors",
+                  chatMode === "agent"
+                    ? "bg-primary/15 text-primary"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                )}
+              >
+                <Cpu className="w-3 h-3" />
+                Agent
+              </button>
+              <button
+                onClick={() => setChatMode("chat")}
+                className={cn(
+                  "flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium transition-colors",
+                  chatMode === "chat"
+                    ? "bg-primary/15 text-primary"
+                    : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                )}
+              >
+                <MessageCircle className="w-3 h-3" />
+                Chat
+              </button>
             </div>
             <div className="flex items-center gap-1">
               {isAgentRunning && (
@@ -887,20 +1001,37 @@ export default function IDE() {
             {agentEvents.length === 0 ? (
               <div className="text-center py-8">
                 <div className="w-14 h-14 rounded-full bg-primary/10 border border-primary/20 flex items-center justify-center mx-auto mb-4">
-                  <Bot className="text-primary w-6 h-6" />
+                  {chatMode === "agent" ? <Bot className="text-primary w-6 h-6" /> : <MessageCircle className="text-primary w-6 h-6" />}
                 </div>
-                <p className="text-sm font-medium text-foreground mb-1">Luxi Agent</p>
-                <p className="text-xs text-muted-foreground mb-1">I can read, write, and edit your code.</p>
-                <p className="text-xs text-muted-foreground mb-4">Run commands. Search files. Build anything.<br />Drop HAR/JSON/CSV files to analyze and recreate.</p>
+                <p className="text-sm font-medium text-foreground mb-1">
+                  {chatMode === "agent" ? "Luxi Agent" : "Luxi Chat"}
+                </p>
+                <p className="text-xs text-muted-foreground mb-1">
+                  {chatMode === "agent"
+                    ? "I can read, write, and edit your code. Run commands. Build anything."
+                    : "Ask me anything about code, architecture, or your project."}
+                </p>
+                <p className="text-xs text-muted-foreground mb-4">
+                  {chatMode === "agent"
+                    ? "Drop HAR/JSON/CSV files to analyze and recreate."
+                    : "I'll answer questions without modifying your code."}
+                </p>
                 <div className="space-y-1.5">
-                  {[
-                    "Build me a complete Express API with routes",
-                    "Create a React landing page with hero section",
-                    "Set up a Python Flask app with database",
+                  {(chatMode === "agent" ? [
+                    "Build me a complete website with login and signup",
+                    "Create a REST API with Express and authentication",
+                    "Set up a React dashboard with charts",
+                    "Build a todo app with database and user accounts",
                     "Add authentication to my app",
                     "Find and fix all bugs in this project",
-                    "Refactor this code for performance",
-                  ].map((suggestion) => (
+                  ] : [
+                    "Explain how authentication works in this project",
+                    "What's the best way to add a database?",
+                    "How should I structure my React components?",
+                    "What are the security concerns with this code?",
+                    "Compare REST vs GraphQL for my use case",
+                    "Help me understand async/await in TypeScript",
+                  ]).map((suggestion) => (
                     <button
                       key={suggestion}
                       onClick={() => { setAgentInput(suggestion); agentInputRef.current?.focus(); }}
@@ -1010,7 +1141,9 @@ export default function IDE() {
                 {isAgentRunning && (
                   <div className="flex items-center gap-2 px-2 py-2 text-xs text-primary">
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    <span className="animate-pulse">Agent is working...</span>
+                    <span className="animate-pulse">
+                      {chatMode === "agent" ? "Agent is working..." : "Thinking..."}
+                    </span>
                   </div>
                 )}
                 <div ref={agentBottomRef} />
@@ -1083,7 +1216,11 @@ export default function IDE() {
                     handleRunAgent();
                   }
                 }}
-                placeholder={attachedFiles.length > 0 ? "Describe what to do with the attached files..." : "Tell Luxi what to build..."}
+                placeholder={
+                  chatMode === "agent"
+                    ? (attachedFiles.length > 0 ? "Describe what to do with the attached files..." : "Tell Luxi what to build...")
+                    : "Ask a question about your code..."
+                }
                 className="flex-1 resize-none text-xs bg-background border border-border rounded-md px-3 py-2 font-mono focus:outline-none focus:ring-1 focus:ring-primary min-h-[34px] max-h-[120px] text-foreground placeholder:text-muted-foreground"
                 disabled={isAgentRunning}
                 rows={1}
@@ -1106,8 +1243,8 @@ export default function IDE() {
               </Button>
             </div>
             <p className="text-[10px] text-muted-foreground mt-1.5">
-              {fileCount} files in project
-              {isAgentRunning && <span className="text-primary ml-1.5 animate-pulse">/ agent running</span>}
+              {chatMode === "agent" ? `${fileCount} files in project` : "Chat mode — no code changes"}
+              {isAgentRunning && <span className="text-primary ml-1.5 animate-pulse">/ {chatMode === "agent" ? "agent running" : "thinking"}</span>}
             </p>
           </div>
         </Panel>
