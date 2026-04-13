@@ -7,6 +7,7 @@ import { promisify } from "util";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as pathLib from "path";
+import { Client as SSHClient } from "ssh2";
 import {
   getActiveProvider,
   agentCall,
@@ -339,7 +340,7 @@ const toolDeclarations: ToolDeclaration[] = [
   },
   {
     name: "check_port",
-    description: "Check if a service is running on a given port and return HTTP status.",
+    description: "Check if a service is running on a given port and return HTTP status. If successful, the user's browser will automatically show a live preview.",
     parameters: {
       type: "OBJECT",
       properties: {
@@ -366,6 +367,23 @@ const toolDeclarations: ToolDeclaration[] = [
         expect_json_path: { type: "STRING", description: "JSON path to check, e.g. 'data.users.length'" },
       },
       required: ["url"],
+    },
+  },
+  {
+    name: "deploy_ssh",
+    description: "Deploy the project to a remote server via SSH. Uploads project files and runs setup/deploy commands. The user must have configured their SSH credentials in project settings. Use this when the user says 'deploy', 'publish', 'push to server', etc.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        host: { type: "STRING", description: "SSH host (IP or domain)" },
+        username: { type: "STRING", description: "SSH username (default: root)" },
+        password: { type: "STRING", description: "SSH password" },
+        privateKey: { type: "STRING", description: "SSH private key (alternative to password)" },
+        port: { type: "NUMBER", description: "SSH port (default: 22)" },
+        remotePath: { type: "STRING", description: "Remote directory to deploy to (default: /var/www/app)" },
+        setupCommands: { type: "STRING", description: "JSON array of commands to run after upload, e.g. [\"npm install\", \"pm2 restart app\"]" },
+      },
+      required: ["host"],
     },
   },
 ];
@@ -489,7 +507,7 @@ async function executeTool(
   args: Record<string, any>,
   projectId: number,
   projectDir: string
-): Promise<{ result: string; fileChanged?: { path: string; action: string } }> {
+): Promise<{ result: string; fileChanged?: { path: string; action: string }; previewPort?: number }> {
   switch (toolName) {
     case "think": {
       return { result: "Thinking recorded. Continue with your plan." };
@@ -975,7 +993,11 @@ async function executeTool(
         const resp = await fetch(`http://localhost:${port}${urlPath}`, { method, signal: AbortSignal.timeout(5000) });
         const elapsed = Date.now() - start;
         const body = await resp.text().catch(() => "");
-        return { result: JSON.stringify({ status: resp.status === expectedStatus ? "PASS" : "FAIL", port, httpStatus: resp.status, expectedStatus, responseTimeMs: elapsed, bodyPreview: body.slice(0, 500) }, null, 2) };
+        const passed = resp.status === expectedStatus;
+        return {
+          result: JSON.stringify({ status: passed ? "PASS" : "FAIL", port, httpStatus: resp.status, expectedStatus, responseTimeMs: elapsed, bodyPreview: body.slice(0, 500) }, null, 2),
+          previewPort: passed ? port : undefined,
+        };
       } catch (err: any) {
         return { result: JSON.stringify({ status: "FAIL", port, error: err.name === "AbortError" ? "Timed out (5s)" : err.message, hint: "Service not running. Start it with manage_process." }, null, 2) };
       }
@@ -1009,6 +1031,92 @@ async function executeTool(
         return { result: JSON.stringify({ overall: tests.every(t => t.pass) ? "ALL PASSED" : "SOME FAILED", url, method, responseTimeMs: elapsed, httpStatus: resp.status, tests, bodyPreview: body.slice(0, 1000) }, null, 2) };
       } catch (err: any) {
         return { result: JSON.stringify({ overall: "FAILED", url, error: err.name === "AbortError" ? "Timed out (15s)" : err.message }, null, 2) };
+      }
+    }
+
+    case "deploy_ssh": {
+      const host = args.host as string;
+      const username = (args.username as string) || "root";
+      const password = args.password as string || undefined;
+      const privateKey = args.privateKey as string || undefined;
+      const sshPort = (args.port as number) || 22;
+      const remotePath = (args.remotePath as string) || "/var/www/app";
+      let setupCommands: string[] = [];
+      if (args.setupCommands) {
+        try { setupCommands = JSON.parse(args.setupCommands as string); } catch { setupCommands = [args.setupCommands as string]; }
+      }
+
+      if (!password && !privateKey) {
+        return { result: "Error: Either password or privateKey is required for SSH authentication" };
+      }
+
+      const sshExec = (conn: InstanceType<typeof SSHClient>, cmd: string): Promise<{ stdout: string; stderr: string; code: number }> => {
+        return new Promise((resolve, reject) => {
+          conn.exec(cmd, (err, stream) => {
+            if (err) return reject(err);
+            let stdout = "";
+            let stderr = "";
+            stream.on("data", (data: Buffer) => { stdout += data.toString(); });
+            stream.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+            stream.on("close", (code: number) => { resolve({ stdout, stderr, code }); });
+          });
+        });
+      };
+
+      try {
+        const conn = new SSHClient();
+        await new Promise<void>((resolve, reject) => {
+          conn.on("ready", () => resolve());
+          conn.on("error", (err) => reject(err));
+          const config: any = { host, port: sshPort, username, readyTimeout: 15000 };
+          if (privateKey) config.privateKey = privateKey;
+          else config.password = password;
+          conn.connect(config);
+        });
+
+        const results: string[] = [];
+
+        await sshExec(conn, `mkdir -p ${remotePath}`);
+        results.push(`Created remote directory: ${remotePath}`);
+
+        const tarName = `deploy_${Date.now()}.tar.gz`;
+        const localTar = pathLib.join(projectDir, `../${tarName}`);
+        await execAsync(
+          `tar czf "${localTar}" --exclude=node_modules --exclude=.git --exclude=__pycache__ --exclude=dist --exclude=venv --exclude=.next -C "${projectDir}" .`,
+          { timeout: 30_000 }
+        );
+
+        const tarStat = await fsPromises.stat(localTar);
+        results.push(`Created archive: ${(tarStat.size / 1024).toFixed(0)}KB`);
+
+        await new Promise<void>((resolve, reject) => {
+          conn.sftp((err, sftp) => {
+            if (err) return reject(err);
+            const readStream = fs.createReadStream(localTar);
+            const writeStream = sftp.createWriteStream(`${remotePath}/${tarName}`);
+            writeStream.on("close", () => resolve());
+            writeStream.on("error", (e: Error) => reject(e));
+            readStream.pipe(writeStream);
+          });
+        });
+        results.push("Uploaded archive to server");
+
+        const extractResult = await sshExec(conn, `cd ${remotePath} && tar xzf ${tarName} && rm ${tarName}`);
+        if (extractResult.code !== 0) results.push(`Extract warning: ${extractResult.stderr.slice(0, 500)}`);
+        else results.push("Extracted files on server");
+
+        await fsPromises.unlink(localTar).catch(() => {});
+
+        for (const cmd of setupCommands) {
+          const r = await sshExec(conn, `cd ${remotePath} && ${cmd}`);
+          const output = (r.stdout + r.stderr).trim().slice(-500);
+          results.push(`$ ${cmd} → exit ${r.code}${output ? "\n" + output : ""}`);
+        }
+
+        conn.end();
+        return { result: `Deployed to ${username}@${host}:${remotePath}\n\n${results.join("\n")}` };
+      } catch (err: any) {
+        return { result: `SSH deploy failed: ${err.message}` };
       }
     }
 
@@ -1065,13 +1173,14 @@ All files exist on the REAL FILESYSTEM at ${projectDir}. Commands execute there.
 
 CURRENT PROJECT FILES: ${fileList}
 
-## TOOLS (22)
+## TOOLS (23)
 **Thinking**: think (USE THIS FIRST for complex tasks)
 **File ops**: list_files, read_file, write_file, create_file, delete_file, edit_file, batch_write_files
 **Search**: grep, search_files, find_and_replace, parse_file
 **Execution**: run_command, install_package (3min timeout), manage_process, read_logs
 **Web**: browse_website, web_search, download_file
-**Testing**: check_port, test_api
+**Testing**: check_port (auto-opens preview on success!), test_api
+**Deploy**: deploy_ssh (deploy to any server via SSH)
 **VCS**: git_operation
 
 ## WORKFLOW — Follow this EXACTLY for building apps:
@@ -1248,7 +1357,7 @@ index.html + style.css + script.js → npx serve .
 
           for (let i = 0; i < results.length; i++) {
             const tc = agentResult.toolCalls[i];
-            const { result, fileChanged } = results[i];
+            const { result, fileChanged, previewPort } = results[i];
             const compacted = compactToolResult(tc.name, result);
 
             sendEvent({
@@ -1257,6 +1366,7 @@ index.html + style.css + script.js → npx serve .
             });
 
             if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
+            if (previewPort) sendEvent({ type: "preview_port", port: previewPort });
             functionResponses.push({ functionResponse: { name: tc.name, response: { result: compacted } } });
           }
         } else {
@@ -1270,11 +1380,13 @@ index.html + style.css + script.js → npx serve .
                 ? { files: `(batch of files)` }
                 : tc.name === "think"
                   ? { thought: "(thinking...)" }
-                  : tc.args;
+                  : tc.name === "deploy_ssh"
+                    ? { host: tc.args.host, remotePath: tc.args.remotePath || "/var/www/app" }
+                    : tc.args;
 
             sendEvent({ type: "tool_call", id: callId, tool: tc.name, args: displayArgs });
 
-            const { result, fileChanged } = await executeTool(tc.name, tc.args, projectId, projectDir);
+            const { result, fileChanged, previewPort } = await executeTool(tc.name, tc.args, projectId, projectDir);
             const compacted = compactToolResult(tc.name, result);
 
             sendEvent({
@@ -1283,6 +1395,7 @@ index.html + style.css + script.js → npx serve .
             });
 
             if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
+            if (previewPort) sendEvent({ type: "preview_port", port: previewPort });
             functionResponses.push({ functionResponse: { name: tc.name, response: { result: compacted } } });
           }
         }

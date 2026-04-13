@@ -48,14 +48,15 @@ Each project has a real filesystem directory at `/home/runner/projects/{projectI
 - `list_files` shows both DB files and disk-only files
 - This means the agent can build real apps: write code, install dependencies, start servers, and test them
 
-### Agent Capabilities (22 tools)
+### Agent Capabilities (23 tools)
 The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
 - Thinking: think (structured reasoning before complex tasks, inspired by Claude Code)
 - File operations: list, read, write, create, delete, edit, batch_write_files, search, find & replace, parse
 - Search: grep (real filesystem grep with regex), search_files (DB search)
 - Execution: run_command (2-min timeout), install_package (3-min timeout), manage_process, read_logs
 - Web: browse_website, web_search, download_file
-- Testing: check_port, test_api
+- Testing: check_port (auto-opens live preview on success), test_api
+- Deployment: deploy_ssh (deploy to any server via SSH using ssh2 — tar+upload+extract+run setup commands)
 - Version control: git_operation
 
 ### Agent Performance Optimizations (Claude Code inspired)
@@ -74,6 +75,9 @@ The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
 - Editor watches `selectedFile.content` + `updatedAt` with `isUserEditingRef`/`userEditTimeRef` to avoid overwriting user edits during agent writes
 - File list polls every 3 seconds for agent-created files
 - Agent panel supports file attachment (drag & drop or click) for HAR/JSON/CSV analysis
+- Live preview pane: auto-opens when agent's check_port succeeds, shows the running app in an iframe
+- preview_port event: agent emits this when a port check passes → frontend auto-sets URL and opens preview
+- Preview has refresh button, URL bar, and close button
 
 ### Terminal
 WebSocket terminal at `/api/ws/terminal` using node-pty for real shell access.

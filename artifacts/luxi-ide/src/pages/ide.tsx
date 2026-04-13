@@ -94,6 +94,7 @@ type AgentEvent =
   | { type: "tool_call"; id: string; tool: string; args: Record<string, any> }
   | { type: "tool_result"; id: string; tool: string; result: string }
   | { type: "file_changed"; path: string; action: string }
+  | { type: "preview_port"; port: number }
   | { type: "message"; content: string }
   | { type: "error"; content: string }
   | { type: "done" };
@@ -122,6 +123,7 @@ function getToolIcon(tool: string) {
     case "parse_file": return <File className="w-3 h-3" />;
     case "check_port": return <Globe className="w-3 h-3" />;
     case "test_api": return <Play className="w-3 h-3" />;
+    case "deploy_ssh": return <Upload className="w-3 h-3" />;
     default: return <Zap className="w-3 h-3" />;
   }
 }
@@ -150,6 +152,7 @@ function getToolLabel(tool: string) {
     case "parse_file": return "Parsing file";
     case "check_port": return "Checking port";
     case "test_api": return "Testing API";
+    case "deploy_ssh": return "Deploying via SSH";
     default: return tool;
   }
 }
@@ -179,6 +182,8 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "border-pink-500/30 bg-pink-500/5"
     : tool === "check_port" || tool === "test_api"
     ? "border-emerald-500/30 bg-emerald-500/5"
+    : tool === "deploy_ssh"
+    ? "border-sky-500/30 bg-sky-500/5"
     : "border-blue-500/30 bg-blue-500/5";
 
   const iconColor = tool === "think"
@@ -199,6 +204,8 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "text-pink-400"
     : tool === "check_port" || tool === "test_api"
     ? "text-emerald-400"
+    : tool === "deploy_ssh"
+    ? "text-sky-400"
     : "text-blue-400";
 
   return (
@@ -639,6 +646,11 @@ export default function IDE() {
               if (event.type === "file_changed") {
                 queryClient.invalidateQueries({ queryKey: getListFilesQueryKey(projectId) });
               }
+              if (event.type === "preview_port" && (event as any).port) {
+                const port = (event as any).port;
+                setPreviewUrl(`http://localhost:${port}`);
+                setShowPreview(true);
+              }
             } catch {}
           }
         }
@@ -911,23 +923,37 @@ export default function IDE() {
                     type="text"
                     value={previewUrl}
                     onChange={(e) => setPreviewUrl(e.target.value)}
-                    placeholder="Enter URL to preview..."
+                    placeholder="Enter URL to preview (auto-fills when agent starts a server)..."
                     className="flex-1 text-xs bg-transparent border-none outline-none font-mono text-foreground placeholder:text-muted-foreground"
                     onKeyDown={(e) => e.key === "Enter" && setPreviewUrl((e.target as HTMLInputElement).value)}
                   />
+                  {previewUrl && (
+                    <button
+                      onClick={() => {
+                        const iframe = document.querySelector("[data-preview-iframe]") as HTMLIFrameElement;
+                        if (iframe) { iframe.src = previewUrl; }
+                      }}
+                      className="p-0.5 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+                      title="Refresh"
+                    >
+                      <Play className="w-3 h-3" />
+                    </button>
+                  )}
                   <button onClick={() => setShowPreview(false)} className="p-0.5 rounded hover:bg-muted transition-colors text-muted-foreground">
                     <EyeOff className="w-3 h-3" />
                   </button>
                 </div>
                 {previewUrl ? (
                   <iframe
+                    data-preview-iframe
                     src={previewUrl}
                     className="flex-1 w-full bg-white"
                     sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
                   />
                 ) : (
-                  <div className="flex-1 flex items-center justify-center text-muted-foreground text-xs">
-                    Enter a URL above to preview a website
+                  <div className="flex-1 flex items-center justify-center text-muted-foreground text-xs flex-col gap-2">
+                    <Globe className="w-8 h-8 opacity-30" />
+                    <span>Ask the agent to build a web app — the preview will appear here automatically</span>
                   </div>
                 )}
               </div>
@@ -1121,6 +1147,20 @@ export default function IDE() {
                           <FileEdit className="w-3 h-3 text-green-400" />
                           <span className="text-green-400 font-medium">{event.action}</span>
                           <span className="text-foreground font-mono text-[11px]">{event.path}</span>
+                        </motion.div>
+                      );
+
+                    case "preview_port":
+                      return (
+                        <motion.div
+                          key={i}
+                          initial={{ opacity: 0, scale: 0.95 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          className="flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-blue-500/10 border border-blue-500/20 text-xs"
+                        >
+                          <Globe className="w-3 h-3 text-blue-400" />
+                          <span className="text-blue-400 font-medium">Live preview opened</span>
+                          <span className="text-foreground font-mono text-[11px]">localhost:{(event as any).port}</span>
                         </motion.div>
                       );
 
