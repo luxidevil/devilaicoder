@@ -48,13 +48,21 @@ Each project has a real filesystem directory at `/home/runner/projects/{projectI
 - `list_files` shows both DB files and disk-only files
 - This means the agent can build real apps: write code, install dependencies, start servers, and test them
 
-### Agent Capabilities (19 tools)
+### Agent Capabilities (22 tools)
 The autonomous agent (`artifacts/api-server/src/routes/ai/agent.ts`) has:
-- File operations: list, read, write, create, delete, edit, search, find & replace, parse
+- Thinking: think (structured reasoning before complex tasks, inspired by Claude Code)
+- File operations: list, read, write, create, delete, edit, batch_write_files, search, find & replace, parse
+- Search: grep (real filesystem grep with regex), search_files (DB search)
 - Execution: run_command (2-min timeout), install_package (3-min timeout), manage_process, read_logs
 - Web: browse_website, web_search, download_file
 - Testing: check_port, test_api
 - Version control: git_operation
+
+### Agent Performance Optimizations (Claude Code inspired)
+- Parallel tool execution: read-only tools (think, read_file, grep, list_files, etc.) run concurrently via Promise.all
+- Smart output compaction: large command outputs keep head+tail, file reads truncate with char count
+- Context compression: when conversation exceeds 40 turns, older turns are dropped with a compression note
+- batch_write_files: write multiple files in a single tool call for faster project scaffolding
 
 ### AI Provider Format Conversions
 - Agent internally uses Gemini's content format (role/parts with functionCall/functionResponse)

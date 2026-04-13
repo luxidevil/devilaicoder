@@ -99,6 +99,42 @@ async function scanDiskForNewFiles(projectId: number, projectDir: string): Promi
 
 const toolDeclarations: ToolDeclaration[] = [
   {
+    name: "think",
+    description: "Use this tool to think through complex problems step-by-step BEFORE taking action. Use it for: planning multi-file architectures, debugging complex errors, deciding between approaches, analyzing requirements. This tool has no side effects — it just records your thinking. ALWAYS use this before building anything complex.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        thought: { type: "STRING", description: "Your detailed thinking, analysis, or plan" },
+      },
+      required: ["thought"],
+    },
+  },
+  {
+    name: "batch_write_files",
+    description: "Write multiple files at once. MUCH faster than calling write_file repeatedly. Use this when creating a new project or making changes across multiple files. Each file gets written to both database and disk.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        files: { type: "STRING", description: "JSON array of objects with 'path' and 'content' fields, e.g. [{\"path\":\"server.js\",\"content\":\"...\"}]" },
+      },
+      required: ["files"],
+    },
+  },
+  {
+    name: "grep",
+    description: "Search file contents using grep (regex support). Much faster and more powerful than search_files for finding code patterns. Searches the real filesystem.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        pattern: { type: "STRING", description: "Search pattern (regex supported)" },
+        path: { type: "STRING", description: "Directory or file to search in (default: project root)" },
+        include: { type: "STRING", description: "File glob pattern to include (e.g. '*.ts', '*.js')" },
+        flags: { type: "STRING", description: "Additional grep flags (e.g. '-i' for case-insensitive, '-l' for files-only, '-c' for count)" },
+      },
+      required: ["pattern"],
+    },
+  },
+  {
     name: "list_files",
     description: "List all files in the current project with their paths and languages",
     parameters: {
@@ -429,6 +465,25 @@ function parseFileContent(
   }
 }
 
+function compactToolResult(toolName: string, result: string): string {
+  if (result.length <= 12000) return result;
+
+  if (toolName === "run_command" || toolName === "install_package") {
+    const lines = result.split("\n");
+    if (lines.length > 80) {
+      const head = lines.slice(0, 20).join("\n");
+      const tail = lines.slice(-40).join("\n");
+      return `${head}\n\n... (${lines.length - 60} lines omitted) ...\n\n${tail}`;
+    }
+  }
+
+  if (toolName === "read_file" || toolName === "browse_website") {
+    return result.slice(0, 12000) + `\n\n... (truncated from ${result.length} chars)`;
+  }
+
+  return result.slice(0, 15000) + `\n...(truncated from ${result.length} chars)`;
+}
+
 async function executeTool(
   toolName: string,
   args: Record<string, any>,
@@ -436,6 +491,77 @@ async function executeTool(
   projectDir: string
 ): Promise<{ result: string; fileChanged?: { path: string; action: string } }> {
   switch (toolName) {
+    case "think": {
+      return { result: "Thinking recorded. Continue with your plan." };
+    }
+
+    case "batch_write_files": {
+      const filesStr = args.files as string;
+      let fileList: { path: string; content: string }[];
+      try {
+        fileList = JSON.parse(filesStr);
+      } catch (err: any) {
+        return { result: `Error parsing files JSON: ${err.message}` };
+      }
+      if (!Array.isArray(fileList) || fileList.length === 0) {
+        return { result: "Error: files must be a non-empty JSON array" };
+      }
+
+      const results: string[] = [];
+      let lastChanged: { path: string; action: string } | undefined;
+
+      for (const f of fileList) {
+        if (!f.path || f.content === undefined) {
+          results.push(`Skipped: missing path or content`);
+          continue;
+        }
+        const filePath = f.path;
+        const content = f.content;
+
+        await syncFileToDisk(projectDir, filePath, content);
+
+        const existing = await db.select().from(filesTable).where(eq(filesTable.projectId, projectId));
+        const ex = existing.find(e => e.path === filePath);
+
+        if (ex) {
+          await db.update(filesTable).set({ content, updatedAt: new Date() }).where(eq(filesTable.id, ex.id));
+          results.push(`Updated ${filePath} (${content.length} chars)`);
+        } else {
+          const name = filePath.split("/").pop() ?? filePath;
+          const lang = getLanguageFromPath(filePath);
+          await db.insert(filesTable).values({ projectId, name, path: filePath, content, language: lang });
+          results.push(`Created ${filePath} (${content.length} chars)`);
+        }
+        lastChanged = { path: filePath, action: ex ? "updated" : "created" };
+      }
+
+      return {
+        result: `Batch wrote ${fileList.length} file(s):\n${results.join("\n")}`,
+        fileChanged: lastChanged,
+      };
+    }
+
+    case "grep": {
+      const pattern = args.pattern as string;
+      const searchPath = args.path ? pathLib.join(projectDir, args.path as string) : projectDir;
+      const include = args.include as string || "";
+      const flags = args.flags as string || "";
+      try {
+        let cmd = `grep -rn ${flags} --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=__pycache__ --exclude-dir=dist --exclude-dir=.next --exclude-dir=.cache --exclude-dir=venv`;
+        if (include) cmd += ` --include="${include}"`;
+        cmd += ` "${pattern.replace(/"/g, '\\"')}" "${searchPath}" 2>/dev/null | head -100`;
+
+        const { stdout } = await execAsync(cmd, { timeout: 10_000, maxBuffer: 512 * 1024 });
+        const output = stdout.trim();
+        if (!output) return { result: `No matches for "${pattern}"` };
+        const cleaned = output.replace(new RegExp(projectDir + "/", "g"), "");
+        return { result: cleaned };
+      } catch (err: any) {
+        if (err.code === 1) return { result: `No matches for "${pattern}"` };
+        return { result: `Grep error: ${(err.stderr || err.message || "").slice(0, 2000)}` };
+      }
+    }
+
     case "list_files": {
       const files = await db.select({
         id: filesTable.id, name: filesTable.name, path: filesTable.path, language: filesTable.language,
@@ -932,68 +1058,108 @@ router.post("/ai/agent", async (req, res): Promise<void> => {
     const projectFiles = await db.select({ name: filesTable.name, path: filesTable.path }).from(filesTable).where(eq(filesTable.projectId, projectId));
     const fileList = projectFiles.map(f => f.path).join(", ") || "No files yet — empty project";
 
-    const systemPrompt = `You are Luxi — an elite autonomous AI coding agent. You are as powerful as the best AI coding assistants in the world. You build production-quality, visually stunning applications from scratch.
+    const systemPrompt = `You are Luxi — an elite autonomous AI coding agent, as powerful as the best AI coding assistants in the world. You build production-quality, visually stunning applications from scratch autonomously.
 
-CRITICAL: All files you create exist on the REAL FILESYSTEM at ${projectDir}. When you write_file, it saves to both the project database AND disk. When you run_command or install_package, commands execute IN that directory. This means:
-- write_file("package.json", ...) → creates ${projectDir}/package.json
-- install_package("npm install express") → runs in ${projectDir}
-- run_command("node server.js") → runs in ${projectDir}
-- manage_process start "node server.js" → runs in ${projectDir}
-
-Everything works exactly like a real development environment. You can build AND run anything.
+## ENVIRONMENT
+All files exist on the REAL FILESYSTEM at ${projectDir}. Commands execute there. This is a full development environment.
 
 CURRENT PROJECT FILES: ${fileList}
 
-TOOLS (19): list_files, read_file, write_file, create_file, delete_file, edit_file, search_files, find_and_replace, parse_file, run_command, install_package, manage_process, read_logs, browse_website, web_search, download_file, check_port, test_api, git_operation
+## TOOLS (22)
+**Thinking**: think (USE THIS FIRST for complex tasks)
+**File ops**: list_files, read_file, write_file, create_file, delete_file, edit_file, batch_write_files
+**Search**: grep, search_files, find_and_replace, parse_file
+**Execution**: run_command, install_package (3min timeout), manage_process, read_logs
+**Web**: browse_website, web_search, download_file
+**Testing**: check_port, test_api
+**VCS**: git_operation
 
-MASTER WORKFLOW:
-1. PLAN the architecture and all files needed
-2. Create package.json (for Node.js) or requirements.txt (for Python) FIRST
-3. Write ALL source files with COMPLETE code — NEVER use placeholders, TODOs, or "..."
-4. Install dependencies with install_package
-5. Start the server with manage_process
-6. Verify with check_port / test_api
-7. If anything fails: read the error, fix it, try again
+## WORKFLOW — Follow this EXACTLY for building apps:
 
-DESIGN STANDARDS — Make everything look INCREDIBLE:
-- Use modern CSS: gradients, shadows, rounded corners, smooth transitions, hover effects
-- Dark mode by default with rich color palettes (not plain white/black)
-- Professional typography: system font stack or Google Fonts
-- Responsive layouts with flexbox/grid
-- Micro-interactions: button hover states, loading spinners, toast notifications
-- Use emojis and icons for visual richness
-- Card-based layouts with proper spacing
-- Form inputs with focus states and validation feedback
-- Animated page transitions where appropriate
-- Mobile-friendly responsive design
+### Step 1: THINK
+Always start with the \`think\` tool to plan your architecture:
+- What files are needed? What's the directory structure?
+- What dependencies? What's the tech stack?
+- Any edge cases or potential issues?
 
-ARCHITECTURE PATTERNS:
-For Node.js/Express apps:
-  - package.json → server.js → public/index.html + public/style.css + public/app.js
-  - Use express.static("public") to serve frontend
-  - Use bcryptjs for password hashing, jsonwebtoken for auth
-  - Use better-sqlite3 or lowdb for simple databases
-  - Always set PORT from env or default 3000
+### Step 2: WRITE ALL FILES
+Use \`batch_write_files\` to write multiple files in ONE call. This is MUCH faster.
+Write COMPLETE files. Every. Single. Time. No placeholders, no TODOs, no "..." or "// rest of code".
 
-For Python/Flask apps:
-  - requirements.txt → app.py → templates/ + static/
-  - Use flask, flask-login, werkzeug.security
+### Step 3: INSTALL & RUN
+- install_package for dependencies
+- manage_process to start servers in background
+- check_port to verify it's working
 
-For static sites:
-  - index.html + style.css + script.js
-  - Use a simple HTTP server: npx serve or python -m http.server
+### Step 4: ITERATE
+If something fails, read the error, fix the specific file, retry. You have ${MAX_AGENT_ITERATIONS} iterations.
 
-CRITICAL RULES:
-1. NEVER give up. You have ${MAX_AGENT_ITERATIONS} iterations. Fix errors and retry.
-2. ALWAYS write COMPLETE files. Never "// rest of code" or "..." or "TODO".
-3. ALWAYS install dependencies before running code.
-4. After starting a server, ALWAYS verify it works with check_port.
-5. If a command fails, READ the error output and fix the specific issue.
-6. For web apps: serve static files, handle CORS, use proper error handling.
-7. When building login systems: ALWAYS hash passwords, validate inputs, use sessions/JWT.
-8. NEVER say "I can't" — you have every tool needed to build anything.
-9. After running install_package, new files (like package-lock.json) are auto-synced.
-10. Use manage_process to start servers in background, then check_port to verify.`;
+## DESIGN STANDARDS — Make everything look INCREDIBLE:
+- Modern CSS: gradients (linear-gradient), box-shadows, border-radius, smooth transitions (0.2-0.3s)
+- Dark mode by default: rich backgrounds (#0f172a, #1e293b), accent colors (#3b82f6, #8b5cf6, #10b981)
+- Typography: system font stack (-apple-system, BlinkMacSystemFont, 'Segoe UI', ...)
+- Responsive: flexbox/grid, mobile-first, clamp() for fluid sizing
+- Micro-interactions: hover scale(1.02), focus rings, loading skeletons, toast notifications
+- Cards with subtle borders, shadows, hover states
+- Form inputs: focus outlines, validation states, placeholder text
+- Animations: @keyframes for loaders, fadeIn for content, smooth scrolling
+- Professional color system: primary, secondary, accent, danger, success, muted
+- Status indicators, badges, avatars, progress bars
+
+## ARCHITECTURE PATTERNS:
+
+### Node.js/Express (DEFAULT for most web apps):
+\`\`\`
+package.json → server.js → public/index.html + public/style.css + public/app.js
+\`\`\`
+- express.static("public"), cors(), express.json()
+- bcryptjs for passwords, jsonwebtoken for auth tokens
+- better-sqlite3 for database (sync, zero-config, fast)
+- PORT = process.env.PORT || 3000
+
+### Python/Flask:
+\`\`\`
+requirements.txt → app.py → templates/*.html + static/style.css + static/app.js
+\`\`\`
+
+### React (with Vite):
+\`\`\`
+package.json → vite.config.js → index.html → src/main.jsx → src/App.jsx → src/components/*.jsx
+\`\`\`
+
+### Static sites:
+\`\`\`
+index.html + style.css + script.js → npx serve .
+\`\`\`
+
+## ANTI-PATTERNS — NEVER do these:
+- ❌ Writing partial files with "..." or "// remaining code here"
+- ❌ Saying "I can't" or "I'm unable to" — you CAN do everything
+- ❌ Installing packages without package.json first
+- ❌ Starting a server without verifying it with check_port
+- ❌ Using placeholder data when real implementation is needed
+- ❌ Forgetting to handle errors in routes
+- ❌ Skipping the think step for complex tasks
+- ❌ Writing one file at a time when batch_write_files is available
+
+## DEBUGGING PROTOCOL:
+1. Read the FULL error message carefully
+2. Use \`grep\` to find related code patterns
+3. Use \`read_file\` to see the file with the error
+4. Use \`edit_file\` for surgical fixes (not full rewrites)
+5. Re-run and verify
+
+## CRITICAL RULES:
+1. NEVER give up. Fix errors and retry until it works.
+2. ALWAYS write COMPLETE files — every line of code.
+3. ALWAYS install dependencies before running.
+4. ALWAYS verify servers with check_port after starting.
+5. NEVER say "I can't" — you have every tool needed.
+6. Use batch_write_files for multi-file creation.
+7. Use grep for finding code patterns.
+8. Use think for planning complex tasks.
+9. Hash passwords, validate inputs, handle errors — always.
+10. After install_package, new files auto-sync to the project.`;
 
     const chatHistory: any[] = (history ?? []).slice(-20).map(m => ({
       role: m.role === "assistant" ? "model" : "user",
@@ -1063,30 +1229,73 @@ CRITICAL RULES:
 
         const functionResponses: any[] = [];
 
-        for (const tc of agentResult.toolCalls) {
-          if (aborted) break;
-          const callId = `tc_${toolCallCounter++}`;
+        const readOnlyTools = new Set(["think", "list_files", "read_file", "search_files", "grep", "check_port", "test_api", "read_logs", "browse_website", "web_search", "parse_file"]);
+        const canParallelize = agentResult.toolCalls.length > 1 && agentResult.toolCalls.every(tc => readOnlyTools.has(tc.name));
 
-          sendEvent({
-            type: "tool_call", id: callId, tool: tc.name,
-            args: (tc.name === "write_file" || tc.name === "create_file")
-              ? { ...tc.args, content: `(${(tc.args.content?.length ?? 0)} chars)` } : tc.args,
-          });
+        if (canParallelize) {
+          const callIds = agentResult.toolCalls.map(() => `tc_${toolCallCounter++}`);
+          for (let i = 0; i < agentResult.toolCalls.length; i++) {
+            const tc = agentResult.toolCalls[i];
+            sendEvent({
+              type: "tool_call", id: callIds[i], tool: tc.name,
+              args: tc.name === "think" ? { thought: "(thinking...)" } : tc.args,
+            });
+          }
 
-          const { result, fileChanged } = await executeTool(tc.name, tc.args, projectId, projectDir);
-          const truncated = result.length > 15000 ? result.slice(0, 15000) + "\n...(truncated)" : result;
+          const results = await Promise.all(
+            agentResult.toolCalls.map(tc => executeTool(tc.name, tc.args, projectId, projectDir))
+          );
 
-          sendEvent({
-            type: "tool_result", id: callId, tool: tc.name,
-            result: truncated.length > 800 ? truncated.slice(0, 800) + "..." : truncated,
-          });
+          for (let i = 0; i < results.length; i++) {
+            const tc = agentResult.toolCalls[i];
+            const { result, fileChanged } = results[i];
+            const compacted = compactToolResult(tc.name, result);
 
-          if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
+            sendEvent({
+              type: "tool_result", id: callIds[i], tool: tc.name,
+              result: compacted.length > 800 ? compacted.slice(0, 800) + "..." : compacted,
+            });
 
-          functionResponses.push({ functionResponse: { name: tc.name, response: { result: truncated } } });
+            if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
+            functionResponses.push({ functionResponse: { name: tc.name, response: { result: compacted } } });
+          }
+        } else {
+          for (const tc of agentResult.toolCalls) {
+            if (aborted) break;
+            const callId = `tc_${toolCallCounter++}`;
+
+            const displayArgs = (tc.name === "write_file" || tc.name === "create_file")
+              ? { ...tc.args, content: `(${(tc.args.content?.length ?? 0)} chars)` }
+              : tc.name === "batch_write_files"
+                ? { files: `(batch of files)` }
+                : tc.name === "think"
+                  ? { thought: "(thinking...)" }
+                  : tc.args;
+
+            sendEvent({ type: "tool_call", id: callId, tool: tc.name, args: displayArgs });
+
+            const { result, fileChanged } = await executeTool(tc.name, tc.args, projectId, projectDir);
+            const compacted = compactToolResult(tc.name, result);
+
+            sendEvent({
+              type: "tool_result", id: callId, tool: tc.name,
+              result: compacted.length > 800 ? compacted.slice(0, 800) + "..." : compacted,
+            });
+
+            if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
+            functionResponses.push({ functionResponse: { name: tc.name, response: { result: compacted } } });
+          }
         }
 
         contents.push({ role: "user", parts: functionResponses });
+
+        if (contents.length > 40) {
+          const systemParts = contents.slice(0, 2);
+          const recentParts = contents.slice(-30);
+          const droppedCount = contents.length - 32;
+          const compressionNote = { role: "user", parts: [{ text: `[Context: ${droppedCount} earlier conversation turns were compressed to save memory. Key context is preserved in recent messages.]` }] };
+          contents = [...systemParts, compressionNote, ...recentParts];
+        }
       }
 
       if ((agentResult.finishReason === "STOP" || agentResult.finishReason === "end_turn" || agentResult.finishReason === "stop") && agentResult.toolCalls.length === 0) break;

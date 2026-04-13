@@ -100,12 +100,15 @@ type AgentEvent =
 
 function getToolIcon(tool: string) {
   switch (tool) {
+    case "think": return <Zap className="w-3 h-3" />;
     case "read_file": return <Eye className="w-3 h-3" />;
     case "write_file": return <FileEdit className="w-3 h-3" />;
     case "create_file": return <FilePlus className="w-3 h-3" />;
+    case "batch_write_files": return <FilePlus className="w-3 h-3" />;
     case "delete_file": return <Trash2 className="w-3 h-3" />;
     case "list_files": return <FolderOpen className="w-3 h-3" />;
     case "search_files": return <Search className="w-3 h-3" />;
+    case "grep": return <Search className="w-3 h-3" />;
     case "run_command": return <Terminal className="w-3 h-3" />;
     case "install_package": return <Play className="w-3 h-3" />;
     case "browse_website": return <Globe className="w-3 h-3" />;
@@ -125,12 +128,15 @@ function getToolIcon(tool: string) {
 
 function getToolLabel(tool: string) {
   switch (tool) {
+    case "think": return "Thinking...";
     case "read_file": return "Reading file";
     case "write_file": return "Writing file";
     case "create_file": return "Creating file";
+    case "batch_write_files": return "Writing files";
     case "delete_file": return "Deleting file";
     case "list_files": return "Listing files";
     case "search_files": return "Searching files";
+    case "grep": return "Searching code";
     case "run_command": return "Running command";
     case "install_package": return "Installing packages";
     case "browse_website": return "Browsing website";
@@ -155,7 +161,9 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
   isExpanded: boolean;
   onToggle: () => void;
 }) {
-  const toolColor = tool.includes("write") || tool.includes("create") || tool === "edit_file"
+  const toolColor = tool === "think"
+    ? "border-violet-500/30 bg-violet-500/5"
+    : tool.includes("write") || tool.includes("create") || tool === "edit_file" || tool === "batch_write_files"
     ? "border-green-500/30 bg-green-500/5"
     : tool === "delete_file"
     ? "border-red-500/30 bg-red-500/5"
@@ -165,7 +173,7 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "border-purple-500/30 bg-purple-500/5"
     : tool === "git_operation"
     ? "border-orange-500/30 bg-orange-500/5"
-    : tool === "find_and_replace"
+    : tool === "find_and_replace" || tool === "grep"
     ? "border-cyan-500/30 bg-cyan-500/5"
     : tool === "parse_file"
     ? "border-pink-500/30 bg-pink-500/5"
@@ -173,7 +181,9 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "border-emerald-500/30 bg-emerald-500/5"
     : "border-blue-500/30 bg-blue-500/5";
 
-  const iconColor = tool.includes("write") || tool.includes("create") || tool === "edit_file"
+  const iconColor = tool === "think"
+    ? "text-violet-400"
+    : tool.includes("write") || tool.includes("create") || tool === "edit_file" || tool === "batch_write_files"
     ? "text-green-400"
     : tool === "delete_file"
     ? "text-red-400"
@@ -183,7 +193,7 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
     ? "text-purple-400"
     : tool === "git_operation"
     ? "text-orange-400"
-    : tool === "find_and_replace"
+    : tool === "find_and_replace" || tool === "grep"
     ? "text-cyan-400"
     : tool === "parse_file"
     ? "text-pink-400"
