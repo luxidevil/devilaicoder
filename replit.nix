@@ -1,5 +1,6 @@
 {pkgs}: {
   deps = [
+    pkgs.wabt
     pkgs.jq
     pkgs.tcpdump
     pkgs.nmap

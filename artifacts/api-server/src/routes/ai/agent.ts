@@ -1056,6 +1056,41 @@ const toolDeclarations: ToolDeclaration[] = [
     },
   },
   {
+    name: "web_search",
+    description: "Search the open web (DuckDuckGo HTML, no API key) and return the top results. Use for: looking up CVEs, unknown error messages, library docs, magic-byte signatures, file format references, current versions, anything that needs fresh public knowledge. Returns title + URL + snippet for each hit. Follow up with http_request or browse_website to fetch the actual content of a promising link.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        query: { type: "STRING", description: "Search query, e.g. 'CVE-2024-3094 xz backdoor', 'magic bytes 7F454C46', 'react query v5 invalidateQueries'." },
+        max_results: { type: "NUMBER", description: "Max results to return (default 8, max 20)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "cve_lookup",
+    description: "Look up a specific CVE in the NIST NVD database (free, no API key). Returns CVSS score, severity, description, references, and CWE classification. Use during security audits or when the user mentions a CVE ID.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        cve_id: { type: "STRING", description: "CVE identifier in canonical form, e.g. 'CVE-2024-3094'." },
+      },
+      required: ["cve_id"],
+    },
+  },
+  {
+    name: "pcap_summary",
+    description: "Summarize a tcpdump pcap capture file: top talkers, top destination ports, DNS queries, HTTP requests, total packets/bytes. Uses pre-installed tcpdump. Path is project-relative or absolute. Use after a `manage_process tcpdump ...` capture session to triage the traffic without dumping every packet into chat.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        path: { type: "STRING", description: "Path to the .pcap file (project-relative or absolute, e.g. '/tmp/cap.pcap')." },
+        max_packets: { type: "NUMBER", description: "Cap packets parsed (default 5000, max 50000) for speed on large captures." },
+      },
+      required: ["path"],
+    },
+  },
+  {
     name: "deploy_ssh",
     description: "Deploy the project to a remote server via SSH. Uploads project files and runs setup/deploy commands. The user must have configured their SSH credentials in project settings. Use this when the user says 'deploy', 'publish', 'push to server', etc.",
     parameters: {
@@ -3526,6 +3561,161 @@ async function executeTool(
       return { result: out.join("\n\n") || "(no inspection output)" };
     }
 
+    case "web_search": {
+      const query = asStr(args.query).trim();
+      if (!query) return { result: "Error: query required" };
+      const maxResults = Math.min(20, Math.max(1, Number(args.max_results) || 8));
+      const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), 12_000);
+      try {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+          },
+          body: `q=${encodeURIComponent(query)}&b=&kl=us-en`,
+          signal: ac.signal,
+        });
+        if (!resp.ok) return { result: `Error: search returned HTTP ${resp.status}` };
+        const html = await resp.text();
+        // Parse the html.duckduckgo.com results page. Each result block contains:
+        //   <a class="result__a" rel=... href="<redirect-or-direct>">TITLE</a>
+        //   <a class="result__snippet" href="...">SNIPPET</a>  (sometimes class="result__snippet")
+        const results: { title: string; url: string; snippet: string }[] = [];
+        const blockRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>|<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>)/g;
+        const stripTags = (s: string) => s.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+        const decodeRedirect = (raw: string): string => {
+          // DDG often wraps in //duckduckgo.com/l/?uddg=<encoded>&...
+          try {
+            const m = raw.match(/[?&]uddg=([^&]+)/);
+            if (m) return decodeURIComponent(m[1]);
+          } catch {}
+          if (raw.startsWith("//")) return "https:" + raw;
+          return raw;
+        };
+        let m: RegExpExecArray | null;
+        while ((m = blockRe.exec(html)) && results.length < maxResults) {
+          const link = decodeRedirect(m[1]);
+          const title = stripTags(m[2]);
+          const snippet = stripTags(m[3] || m[4] || "");
+          if (title && link) results.push({ title, url: link, snippet });
+        }
+        if (!results.length) return { result: `(no results parsed for "${query}" — DDG may have rate-limited; try again or rephrase)` };
+        const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet.slice(0, 280)}`);
+        return { result: `Web search: "${query}"\n\n${lines.join("\n\n")}` };
+      } catch (err: any) {
+        const reason = err.name === "AbortError" ? "timeout after 12s" : err.message;
+        return { result: `Error: ${reason}` };
+      } finally {
+        clearTimeout(t);
+      }
+    }
+
+    case "cve_lookup": {
+      const cveId = asStr(args.cve_id).trim().toUpperCase();
+      if (!/^CVE-\d{4}-\d{4,7}$/.test(cveId)) return { result: "Error: cve_id must look like CVE-YYYY-NNNN" };
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), 15_000);
+      try {
+        const resp = await fetch(`https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${cveId}`, {
+          headers: { "User-Agent": "luxi-ide/1.0", Accept: "application/json" },
+          signal: ac.signal,
+        });
+        if (resp.status === 404) return { result: `${cveId}: not found in NVD` };
+        if (!resp.ok) return { result: `Error: NVD returned HTTP ${resp.status}` };
+        const data: any = await resp.json();
+        const item = data?.vulnerabilities?.[0]?.cve;
+        if (!item) return { result: `${cveId}: no record returned` };
+        const desc = item.descriptions?.find((d: any) => d.lang === "en")?.value || "(no description)";
+        const metrics31 = item.metrics?.cvssMetricV31?.[0]?.cvssData;
+        const metrics30 = item.metrics?.cvssMetricV30?.[0]?.cvssData;
+        const metrics2 = item.metrics?.cvssMetricV2?.[0]?.cvssData;
+        const m = metrics31 || metrics30 || metrics2;
+        const cvssLine = m
+          ? `CVSS ${metrics31 ? "v3.1" : metrics30 ? "v3.0" : "v2"}: ${m.baseScore} (${m.baseSeverity || "?"}) — ${m.vectorString}`
+          : "CVSS: not yet scored";
+        const cwes: string[] = (item.weaknesses || []).flatMap((w: any) =>
+          (w.description || []).filter((d: any) => d.lang === "en").map((d: any) => d.value)
+        );
+        const refs: string[] = (item.references || []).slice(0, 8).map((r: any) => `  - ${r.url}${r.tags?.length ? ` [${r.tags.join(",")}]` : ""}`);
+        const out = [
+          `# ${cveId}`,
+          `Published: ${item.published?.slice(0, 10) || "?"}   Last modified: ${item.lastModified?.slice(0, 10) || "?"}`,
+          cvssLine,
+          cwes.length ? `CWE: ${[...new Set(cwes)].join(", ")}` : "",
+          `\n## Description\n${desc}`,
+          refs.length ? `\n## References (top 8)\n${refs.join("\n")}` : "",
+        ].filter(Boolean).join("\n");
+        return { result: out };
+      } catch (err: any) {
+        const reason = err.name === "AbortError" ? "timeout after 15s" : err.message;
+        return { result: `Error: ${reason}` };
+      } finally {
+        clearTimeout(t);
+      }
+    }
+
+    case "pcap_summary": {
+      const filePath = asStr(args.path);
+      if (!filePath) return { result: "Error: path required" };
+      const fullPath = pathLib.isAbsolute(filePath) ? filePath : pathLib.join(projectDir, filePath);
+      try { await fsPromises.access(fullPath); } catch { return { result: `Error: file not found: ${filePath}` }; }
+      const maxPackets = Math.min(50_000, Math.max(100, Number(args.max_packets) || 5_000));
+      try {
+        // tcpdump -nn (no DNS), -r <file>, -c <max>
+        const { stdout, stderr } = await execFileAsync("tcpdump", ["-nn", "-r", fullPath, "-c", String(maxPackets)], {
+          timeout: 30_000,
+          maxBuffer: 16 * 1024 * 1024,
+        });
+        const lines = stdout.split("\n").filter(Boolean);
+        const total = lines.length;
+        const srcCount = new Map<string, number>();
+        const dstCount = new Map<string, number>();
+        const dstPort = new Map<string, number>();
+        const dnsQueries = new Map<string, number>();
+        let httpReqs = 0;
+        const httpHostMethods: string[] = [];
+        for (const l of lines) {
+          // typical: "12:34:56.789 IP 10.0.0.1.5555 > 8.8.8.8.443: ..."
+          const m = l.match(/IP6?\s+([0-9a-f.:]+)\.(\d+)\s+>\s+([0-9a-f.:]+)\.(\d+):/i);
+          if (m) {
+            srcCount.set(m[1], (srcCount.get(m[1]) || 0) + 1);
+            dstCount.set(m[3], (dstCount.get(m[3]) || 0) + 1);
+            dstPort.set(m[4], (dstPort.get(m[4]) || 0) + 1);
+          }
+          // DNS A?/AAAA?  e.g. "12345+ A? example.com."
+          const dns = l.match(/\b\d+\+?\s+(?:A|AAAA|MX|TXT|CNAME|NS)\?\s+([^\s]+)\./);
+          if (dns) dnsQueries.set(dns[1], (dnsQueries.get(dns[1]) || 0) + 1);
+          // HTTP-ish lines (only if pcap was -A)
+          if (/HTTP\/1\.[01]/.test(l) || /^(GET|POST|PUT|DELETE|PATCH|HEAD)\s+/.test(l)) {
+            httpReqs++;
+            if (httpHostMethods.length < 20) httpHostMethods.push(l.slice(0, 200));
+          }
+        }
+        const top = (m: Map<string, number>, n: number) =>
+          [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => `  ${k.padEnd(40)} ${v}`).join("\n");
+        const out = [
+          `# pcap summary: ${filePath}`,
+          `packets parsed: ${total} (cap=${maxPackets})`,
+          `unique sources: ${srcCount.size}, unique dests: ${dstCount.size}`,
+          `\n## Top sources (10)\n${top(srcCount, 10) || "  (none)"}`,
+          `\n## Top destinations (10)\n${top(dstCount, 10) || "  (none)"}`,
+          `\n## Top dst ports (10)\n${top(dstPort, 10) || "  (none)"}`,
+          dnsQueries.size ? `\n## DNS queries (${dnsQueries.size} unique)\n${top(dnsQueries, 15)}` : "",
+          httpReqs ? `\n## HTTP-like lines: ${httpReqs}\n${httpHostMethods.slice(0, 10).map(l => "  " + l).join("\n")}` : "",
+          stderr ? `\n## stderr\n${stderr.split("\n").slice(0, 5).join("\n")}` : "",
+        ].filter(Boolean).join("\n");
+        return { result: out };
+      } catch (err: any) {
+        const partial = ((err.stdout || "") + (err.stderr || "")).slice(0, 1500);
+        return { result: `Error: ${err.message}\n${partial}` };
+      }
+    }
+
     case "http_request": {
       const url = asStr(args.url).trim();
       if (!url || !/^https?:\/\//i.test(url)) return { result: "Error: url must start with http:// or https://" };
@@ -4284,7 +4474,12 @@ You have a long-term Findings store per project (DB-backed, survives across chat
 For non-website RE work the senior-engineer escalation ladder is:
 
 ### Pre-installed toolchain (DO NOT re-install):
-The following are already on PATH — call them directly via run_command, never install_package: \`radare2\`/\`r2\`, \`strace\`, \`ltrace\`, \`binwalk\`, \`mitmproxy\`/\`mitmdump\`, \`unzip\`, \`7z\`, \`socat\`, \`nmap\`, \`tcpdump\`, \`jq\`, plus the always-available \`file\`, \`readelf\`, \`objdump\`, \`nm\`, \`strings\`, \`ldd\`, \`od\`, \`python3\`. Only call install_package for things genuinely missing (uncompyle6, wabt, jupyterlab, transformers, etc.).
+The following are already on PATH — call them directly via run_command, never install_package: \`radare2\`/\`r2\`, \`strace\`, \`ltrace\`, \`binwalk\`, \`mitmproxy\`/\`mitmdump\`, \`unzip\`, \`7z\`, \`socat\`, \`nmap\`, \`tcpdump\`, \`jq\`, \`wasm2wat\`/\`wasm-objdump\`/\`wat2wasm\` (wabt), plus the always-available \`file\`, \`readelf\`, \`objdump\`, \`nm\`, \`strings\`, \`ldd\`, \`od\`, \`python3\`. Only call install_package for things genuinely missing (uncompyle6, jupyterlab, transformers, etc.).
+
+### Knowledge / lookup tools (use these BEFORE guessing):
+- **web_search query=...** — DuckDuckGo HTML search (no API key). For unknown error messages, library docs, magic-byte references, current versions. Returns title+url+snippet for each hit; follow up with **http_request** or **browse_website** to fetch a promising result.
+- **cve_lookup cve_id=CVE-YYYY-NNNN** — pulls the official NVD record (CVSS, severity, description, CWE, references). Use any time the user mentions a CVE or you suspect a known vuln.
+- **pcap_summary path=/tmp/cap.pcap** — summarizes a tcpdump capture into top talkers / dst ports / DNS / HTTP lines. Always prefer this over dumping raw packets into chat.
 
 ### Binary triage (ELF/PE/Mach-O/wasm/.pyc/.class):
 1. **inspect_binary path=<file>** — auto-detects format, dumps strings/symbols/sections/ldd, AND runs r2 info/imports/exports + binwalk signature scan when those tools are installed (they are). Always start here.
@@ -4292,7 +4487,7 @@ The following are already on PATH — call them directly via run_command, never 
 3. For runtime tracing: \`run_command "strace -f -e trace=network,file -o /tmp/trace.log <cmd>"\` or \`ltrace -f -o /tmp/ltrace.log <cmd>\`. Read the log with \`read_file\` after.
 4. For firmware / packed blobs: \`run_command "binwalk -e <file>"\` to carve out embedded filesystems / known signatures.
 5. For .pyc → \`install_package "pip install uncompyle6 decompyle3"\` and decompile.
-6. For wasm → \`install_package "npm install -g wabt"\` then \`wasm2wat\`.
+6. For wasm → \`run_command "wasm2wat <path>"\` (wabt is pre-installed) for textual repr, or \`wasm-objdump -x <path>\` for sections/imports.
 7. **If the binary may be hostile** (downloaded from web, attached by user, unknown origin) → run it via **run_sandboxed**, NOT run_command. The sandbox uses a tmp dir, a memory cap, a wall timeout, and proxy-blocked env vars. It is best-effort only (no kernel namespaces in this container) — never trust output that didn't go through it.
 
 ### Network / API reverse engineering:
