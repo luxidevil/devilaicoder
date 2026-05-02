@@ -1040,6 +1040,22 @@ const toolDeclarations: ToolDeclaration[] = [
     },
   },
   {
+    name: "http_request",
+    description: "Make a raw HTTP/HTTPS request from the server. Use for: probing API endpoints during reverse engineering, checking auth flows, fetching public docs, testing webhook receivers. Supports custom method, headers, body, follow-redirects toggle, and a 30s hard timeout. Response is truncated to 32KB. Do NOT use this for things run_command/curl can do inside the project — use it when you specifically want structured response (status + headers + body) back into the chat.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        url: { type: "STRING", description: "Full URL including scheme (http:// or https://)." },
+        method: { type: "STRING", description: "GET | POST | PUT | PATCH | DELETE | HEAD | OPTIONS (default GET)." },
+        headers: { type: "STRING", description: "Optional JSON object of header name->value, e.g. '{\"Authorization\":\"Bearer xyz\",\"Content-Type\":\"application/json\"}'." },
+        body: { type: "STRING", description: "Optional request body. For JSON, stringify it yourself and set Content-Type." },
+        follow_redirects: { type: "BOOLEAN", description: "Follow 3xx redirects (default true, max 5 hops)." },
+        timeout_ms: { type: "NUMBER", description: "Request timeout in ms (default 15000, max 30000)." },
+      },
+      required: ["url"],
+    },
+  },
+  {
     name: "deploy_ssh",
     description: "Deploy the project to a remote server via SSH. Uploads project files and runs setup/deploy commands. The user must have configured their SSH credentials in project settings. Use this when the user says 'deploy', 'publish', 'push to server', etc.",
     parameters: {
@@ -3483,6 +3499,10 @@ async function executeTool(
         }
       };
 
+      const has = async (bin: string): Promise<boolean> => {
+        try { await execFileAsync("which", [bin], { timeout: 2000 }); return true; } catch { return false; }
+      };
+
       await tryExec("file", "file", [fullPath]);
       const stat = await fsPromises.stat(fullPath).catch(() => null);
       if (stat) out.push(`### size\n${stat.size} bytes (${(stat.size / 1024).toFixed(1)} KB)`);
@@ -3491,7 +3511,82 @@ async function executeTool(
       await tryExec("readelf header", "readelf", ["-h", fullPath]);
       await tryExec("ldd (shared lib deps)", "ldd", [fullPath]);
       await tryExec("hex preview (first 256 bytes)", "od", ["-An", "-tx1z", "-w16", fullPath], 16);
+      // Senior-engineer extras (only if installed):
+      if (await has("r2")) {
+        // r2 -q -c "command" file -- quick info + import/export tables.
+        // Use no -A flag here (basic info only) so the 15s timeout is rarely hit on large/complex
+        // binaries. Agent can opt into -AA via run_command if it wants deep analysis.
+        await tryExec("r2 info (iI)", "r2", ["-q", "-c", "iI", fullPath]);
+        await tryExec("r2 imports (iiq, head 60)", "r2", ["-q", "-c", "iiq", fullPath], 60);
+        await tryExec("r2 exports (iEq, head 30)", "r2", ["-q", "-c", "iEq", fullPath], 30);
+      }
+      if (await has("binwalk")) {
+        await tryExec("binwalk signature scan (head 40)", "binwalk", [fullPath], 40);
+      }
       return { result: out.join("\n\n") || "(no inspection output)" };
+    }
+
+    case "http_request": {
+      const url = asStr(args.url).trim();
+      if (!url || !/^https?:\/\//i.test(url)) return { result: "Error: url must start with http:// or https://" };
+      const method = (asStr(args.method) || "GET").toUpperCase();
+      if (!["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"].includes(method)) return { result: `Error: bad method ${method}` };
+      let headers: Record<string, string> = {};
+      if (args.headers) {
+        try {
+          const parsed = JSON.parse(String(args.headers));
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            for (const [k, v] of Object.entries(parsed)) headers[String(k)] = String(v);
+          } else return { result: "Error: headers must be a JSON object" };
+        } catch { return { result: "Error: headers must be valid JSON" }; }
+      }
+      const followRedirects = args.follow_redirects !== false;
+      const timeoutMs = Math.min(30_000, Math.max(1_000, Number(args.timeout_ms) || 15_000));
+      const body = args.body !== undefined && args.body !== null && method !== "GET" && method !== "HEAD" ? String(args.body) : undefined;
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), timeoutMs);
+      try {
+        const resp = await fetch(url, {
+          method,
+          headers,
+          body,
+          redirect: followRedirects ? "follow" : "manual",
+          signal: ac.signal,
+        });
+        const respHeaders: string[] = [];
+        resp.headers.forEach((v, k) => respHeaders.push(`${k}: ${v}`));
+        // Read at most 32KB
+        const reader = resp.body?.getReader();
+        let bodyBytes = new Uint8Array(0);
+        const MAX = 32 * 1024;
+        if (reader) {
+          while (bodyBytes.byteLength < MAX) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const merged = new Uint8Array(bodyBytes.byteLength + value.byteLength);
+            merged.set(bodyBytes); merged.set(value, bodyBytes.byteLength);
+            bodyBytes = merged;
+            if (bodyBytes.byteLength >= MAX) { try { await reader.cancel(); } catch {} break; }
+          }
+        }
+        const truncated = bodyBytes.byteLength >= MAX;
+        const ct = resp.headers.get("content-type") || "";
+        let bodyStr: string;
+        if (/^text\/|json|xml|javascript|html|yaml|csv/i.test(ct) || bodyBytes.byteLength < 4096) {
+          bodyStr = new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes);
+        } else {
+          bodyStr = `(binary, ${bodyBytes.byteLength} bytes — first 256 hex)\n` +
+            Array.from(bodyBytes.slice(0, 256)).map(b => b.toString(16).padStart(2, "0")).join(" ");
+        }
+        return {
+          result: `HTTP ${resp.status} ${resp.statusText}\n${respHeaders.slice(0, 40).join("\n")}\n\n${bodyStr.slice(0, MAX)}${truncated ? "\n…(body truncated at 32KB)" : ""}`,
+        };
+      } catch (err: any) {
+        const reason = err.name === "AbortError" ? `timeout after ${timeoutMs}ms` : err.message;
+        return { result: `Error: ${reason}` };
+      } finally {
+        clearTimeout(t);
+      }
     }
 
     case "process_tree": {
@@ -4188,17 +4283,24 @@ You have a long-term Findings store per project (DB-backed, survives across chat
 ## DEEP REVERSE ENGINEERING — BINARIES, MALWARE, MODELS
 For non-website RE work the senior-engineer escalation ladder is:
 
+### Pre-installed toolchain (DO NOT re-install):
+The following are already on PATH — call them directly via run_command, never install_package: \`radare2\`/\`r2\`, \`strace\`, \`ltrace\`, \`binwalk\`, \`mitmproxy\`/\`mitmdump\`, \`unzip\`, \`7z\`, \`socat\`, \`nmap\`, \`tcpdump\`, \`jq\`, plus the always-available \`file\`, \`readelf\`, \`objdump\`, \`nm\`, \`strings\`, \`ldd\`, \`od\`, \`python3\`. Only call install_package for things genuinely missing (uncompyle6, wabt, jupyterlab, transformers, etc.).
+
 ### Binary triage (ELF/PE/Mach-O/wasm/.pyc/.class):
-1. **inspect_binary path=<file>** — auto-detects format, dumps strings/symbols/sections/ldd. Always start here.
-2. \`run_command file <path>\`, \`readelf -a <path>\`, \`objdump -d <path>\`, \`nm -D <path>\`, \`strings -n 8 <path>\` for deeper layer.
-3. For interactive disassembly, \`install_package "pip install --user r2pipe" && install_package "apt-get install -y radare2"\` then \`run_command "r2 -A -q -c 'aaa; afl; pdf @main' <path>"\`. Falls back to \`objdump -d\` if radare2 install fails.
-4. For .pyc → \`install_package "pip install uncompyle6 decompyle3"\` and decompile.
-5. For wasm → \`install_package "npm install -g wabt"\` then \`wasm2wat\`.
-6. **If the binary may be hostile** (downloaded from web, attached by user, unknown origin) → run it via **run_sandboxed**, NOT run_command. The sandbox uses a tmp dir, a memory cap, a wall timeout, and proxy-blocked env vars. It is best-effort only (no kernel namespaces in this container) — never trust output that didn't go through it.
+1. **inspect_binary path=<file>** — auto-detects format, dumps strings/symbols/sections/ldd, AND runs r2 info/imports/exports + binwalk signature scan when those tools are installed (they are). Always start here.
+2. For deeper disassembly: \`run_command "r2 -A -q -c 'aaa; afl; pdf @main' <path>"\` (interactive disasm) or \`run_command "objdump -d <path> | less"\`.
+3. For runtime tracing: \`run_command "strace -f -e trace=network,file -o /tmp/trace.log <cmd>"\` or \`ltrace -f -o /tmp/ltrace.log <cmd>\`. Read the log with \`read_file\` after.
+4. For firmware / packed blobs: \`run_command "binwalk -e <file>"\` to carve out embedded filesystems / known signatures.
+5. For .pyc → \`install_package "pip install uncompyle6 decompyle3"\` and decompile.
+6. For wasm → \`install_package "npm install -g wabt"\` then \`wasm2wat\`.
+7. **If the binary may be hostile** (downloaded from web, attached by user, unknown origin) → run it via **run_sandboxed**, NOT run_command. The sandbox uses a tmp dir, a memory cap, a wall timeout, and proxy-blocked env vars. It is best-effort only (no kernel namespaces in this container) — never trust output that didn't go through it.
 
 ### Network / API reverse engineering:
-1. For one-off probes use **browse_website raw=true** or **playwright_run save_har=true**.
-2. For sustained traffic capture install mitmproxy: \`install_package "pip install mitmproxy"\`, then \`manage_process start name=mitm command="mitmdump -w /tmp/flows.mitm --listen-port 8081"\`. Configure the target client to use the proxy, then \`run_command "mitmdump -nr /tmp/flows.mitm -s ..."\` to extract endpoints/credentials. Document the discovered endpoints with **note_add kind=endpoint**.
+1. For one-off probes use **http_request** (structured: status + headers + body returned to chat) or **browse_website raw=true** or **playwright_run save_har=true**.
+2. For port scans: \`run_command "nmap -sV -p- -T4 <target>"\` (only against assets you own / are explicitly authorized to test).
+3. For packet capture: \`manage_process start name=tcpdump command="tcpdump -i any -w /tmp/cap.pcap -s 0"\`, reproduce traffic, then \`run_command "tcpdump -nn -r /tmp/cap.pcap | head -200"\`.
+4. For sustained TLS-MITM traffic capture: \`manage_process start name=mitm command="mitmdump -w /tmp/flows.mitm --listen-port 8081"\`. Configure the target client to use the proxy, then \`run_command "mitmdump -nr /tmp/flows.mitm -s ..."\` to extract endpoints/credentials. Document discovered endpoints with **note_add kind=endpoint**.
+5. For TCP relays / port-forwards: \`socat\` is available — useful for poking around firewalled services.
 
 ### ML model reverse engineering:
 1. \`install_package "pip install transformers safetensors torch huggingface_hub --quiet"\`

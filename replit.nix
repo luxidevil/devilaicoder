@@ -1,5 +1,16 @@
 {pkgs}: {
   deps = [
+    pkgs.jq
+    pkgs.tcpdump
+    pkgs.nmap
+    pkgs.socat
+    pkgs.p7zip
+    pkgs.unzip
+    pkgs.mitmproxy
+    pkgs.binwalk
+    pkgs.ltrace
+    pkgs.strace
+    pkgs.radare2
     pkgs.systemd
     pkgs.udev
     pkgs.libgbm
