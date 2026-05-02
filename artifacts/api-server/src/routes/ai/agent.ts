@@ -1057,12 +1057,13 @@ const toolDeclarations: ToolDeclaration[] = [
   },
   {
     name: "web_search",
-    description: "Search the open web (DuckDuckGo HTML, no API key) and return the top results. Use for: looking up CVEs, unknown error messages, library docs, magic-byte signatures, file format references, current versions, anything that needs fresh public knowledge. Returns title + URL + snippet for each hit. Follow up with http_request or browse_website to fetch the actual content of a promising link.",
+    description: "Multi-source knowledge search: aggregates GitHub repositories, GitHub code search, Wikipedia, and npm registry into one ranked result list. Use for: looking up libraries, finding example code, getting concept definitions, finding similar projects, and anything that needs fresh public knowledge. Returns source-tagged hits with title + URL + snippet. Follow up with http_request or browse_website to fetch a promising link. (For specific CVEs use cve_lookup directly.)",
     parameters: {
       type: "OBJECT",
       properties: {
-        query: { type: "STRING", description: "Search query, e.g. 'CVE-2024-3094 xz backdoor', 'magic bytes 7F454C46', 'react query v5 invalidateQueries'." },
-        max_results: { type: "NUMBER", description: "Max results to return (default 8, max 20)." },
+        query: { type: "STRING", description: "Search query, e.g. 'xz backdoor', 'rust memoryfs', 'invalidate react query'." },
+        sources: { type: "STRING", description: "Comma-separated subset of: github_repos, github_code, wikipedia, npm. Default: 'github_repos,wikipedia,npm'. Add github_code only when looking for usage examples (slower)." },
+        max_per_source: { type: "NUMBER", description: "Max results per source (default 4, max 10)." },
       },
       required: ["query"],
     },
@@ -3564,51 +3565,92 @@ async function executeTool(
     case "web_search": {
       const query = asStr(args.query).trim();
       if (!query) return { result: "Error: query required" };
-      const maxResults = Math.min(20, Math.max(1, Number(args.max_results) || 8));
-      const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+      const sourcesArg = asStr(args.sources || "github_repos,wikipedia,npm").toLowerCase();
+      const sources = new Set(sourcesArg.split(",").map(s => s.trim()).filter(Boolean));
+      const perSource = Math.min(10, Math.max(1, Number(args.max_per_source) || 4));
+      const ghToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN;
+      type Hit = { source: string; title: string; url: string; snippet: string };
       const ac = new AbortController();
-      const t = setTimeout(() => ac.abort(), 12_000);
-      try {
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-          },
-          body: `q=${encodeURIComponent(query)}&b=&kl=us-en`,
-          signal: ac.signal,
-        });
-        if (!resp.ok) return { result: `Error: search returned HTTP ${resp.status}` };
-        const html = await resp.text();
-        // Parse the html.duckduckgo.com results page. Each result block contains:
-        //   <a class="result__a" rel=... href="<redirect-or-direct>">TITLE</a>
-        //   <a class="result__snippet" href="...">SNIPPET</a>  (sometimes class="result__snippet")
-        const results: { title: string; url: string; snippet: string }[] = [];
-        const blockRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>|<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>)/g;
-        const stripTags = (s: string) => s.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
-        const decodeRedirect = (raw: string): string => {
-          // DDG often wraps in //duckduckgo.com/l/?uddg=<encoded>&...
+      const t = setTimeout(() => ac.abort(), 15_000);
+      const fetchJson = async (url: string, headers: Record<string,string> = {}): Promise<any> => {
+        const r = await fetch(url, { headers: { "User-Agent": "luxi-ide/1.0", Accept: "application/json", ...headers }, signal: ac.signal });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      };
+      const tasks: Promise<Hit[]>[] = [];
+      if (sources.has("github_repos")) {
+        tasks.push((async (): Promise<Hit[]> => {
           try {
-            const m = raw.match(/[?&]uddg=([^&]+)/);
-            if (m) return decodeURIComponent(m[1]);
-          } catch {}
-          if (raw.startsWith("//")) return "https:" + raw;
-          return raw;
-        };
-        let m: RegExpExecArray | null;
-        while ((m = blockRe.exec(html)) && results.length < maxResults) {
-          const link = decodeRedirect(m[1]);
-          const title = stripTags(m[2]);
-          const snippet = stripTags(m[3] || m[4] || "");
-          if (title && link) results.push({ title, url: link, snippet });
+            const headers: Record<string,string> = { Accept: "application/vnd.github+json" };
+            if (ghToken) headers.Authorization = `Bearer ${ghToken}`;
+            const data: any = await fetchJson(`https://api.github.com/search/repositories?q=${encodeURIComponent(query)}&per_page=${perSource}&sort=stars`, headers);
+            return (data.items || []).slice(0, perSource).map((it: any): Hit => ({
+              source: "github_repo",
+              title: `${it.full_name}  ★${it.stargazers_count}${it.language ? ` · ${it.language}` : ""}`,
+              url: it.html_url,
+              snippet: (it.description || "").slice(0, 240),
+            }));
+          } catch (e: any) { return [{ source: "github_repo", title: `(github_repos error: ${e.message})`, url: "", snippet: "" }]; }
+        })());
+      }
+      if (sources.has("github_code")) {
+        tasks.push((async (): Promise<Hit[]> => {
+          if (!ghToken) return [{ source: "github_code", title: "(github_code requires GITHUB_PERSONAL_ACCESS_TOKEN)", url: "", snippet: "" }];
+          try {
+            const data: any = await fetchJson(`https://api.github.com/search/code?q=${encodeURIComponent(query)}&per_page=${perSource}`, { Accept: "application/vnd.github+json", Authorization: `Bearer ${ghToken}` });
+            return (data.items || []).slice(0, perSource).map((it: any): Hit => ({
+              source: "github_code",
+              title: `${it.repository?.full_name || "?"}: ${it.path}`,
+              url: it.html_url,
+              snippet: (it.text_matches?.[0]?.fragment || "").replace(/\s+/g, " ").slice(0, 240),
+            }));
+          } catch (e: any) { return [{ source: "github_code", title: `(github_code error: ${e.message})`, url: "", snippet: "" }]; }
+        })());
+      }
+      if (sources.has("wikipedia")) {
+        tasks.push((async (): Promise<Hit[]> => {
+          try {
+            const data: any = await fetchJson(`https://en.wikipedia.org/w/api.php?action=opensearch&format=json&search=${encodeURIComponent(query)}&limit=${perSource}`);
+            const titles: string[] = data?.[1] || [];
+            const descs: string[] = data?.[2] || [];
+            const urls: string[] = data?.[3] || [];
+            return titles.map((title, i): Hit => ({ source: "wikipedia", title, url: urls[i] || "", snippet: (descs[i] || "").slice(0, 240) }));
+          } catch (e: any) { return [{ source: "wikipedia", title: `(wikipedia error: ${e.message})`, url: "", snippet: "" }]; }
+        })());
+      }
+      if (sources.has("npm")) {
+        tasks.push((async (): Promise<Hit[]> => {
+          try {
+            const data: any = await fetchJson(`https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(query)}&size=${perSource}`);
+            return (data.objects || []).slice(0, perSource).map((o: any): Hit => {
+              const p = o.package || {};
+              return {
+                source: "npm",
+                title: `${p.name}@${p.version}${p.publisher?.username ? ` · ${p.publisher.username}` : ""}`,
+                url: p.links?.npm || `https://www.npmjs.com/package/${p.name}`,
+                snippet: (p.description || "").slice(0, 240),
+              };
+            });
+          } catch (e: any) { return [{ source: "npm", title: `(npm error: ${e.message})`, url: "", snippet: "" }]; }
+        })());
+      }
+      try {
+        const all = (await Promise.all(tasks)).flat();
+        if (!all.length) return { result: `(no sources selected; valid: github_repos, github_code, wikipedia, npm)` };
+        // Group by source for readability
+        const bySource: Record<string, Hit[]> = {};
+        for (const h of all) (bySource[h.source] ||= []).push(h);
+        const out: string[] = [`Search: "${query}"  (sources: ${[...sources].join(",")})`];
+        for (const [src, hits] of Object.entries(bySource)) {
+          out.push(`\n## ${src}`);
+          for (const h of hits) {
+            if (!h.url) { out.push(`  ${h.title}`); continue; }
+            out.push(`- ${h.title}\n  ${h.url}${h.snippet ? `\n  ${h.snippet}` : ""}`);
+          }
         }
-        if (!results.length) return { result: `(no results parsed for "${query}" — DDG may have rate-limited; try again or rephrase)` };
-        const lines = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet.slice(0, 280)}`);
-        return { result: `Web search: "${query}"\n\n${lines.join("\n\n")}` };
+        return { result: out.join("\n") };
       } catch (err: any) {
-        const reason = err.name === "AbortError" ? "timeout after 12s" : err.message;
+        const reason = err.name === "AbortError" ? "timeout after 15s" : err.message;
         return { result: `Error: ${reason}` };
       } finally {
         clearTimeout(t);
@@ -3621,10 +3663,17 @@ async function executeTool(
       const ac = new AbortController();
       const t = setTimeout(() => ac.abort(), 15_000);
       try {
-        const resp = await fetch(`https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${cveId}`, {
+        let resp = await fetch(`https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${cveId}`, {
           headers: { "User-Agent": "luxi-ide/1.0", Accept: "application/json" },
           signal: ac.signal,
         });
+        if (resp.status === 503 || resp.status === 429) {
+          await new Promise(r => setTimeout(r, 1500));
+          resp = await fetch(`https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${cveId}`, {
+            headers: { "User-Agent": "luxi-ide/1.0", Accept: "application/json" },
+            signal: ac.signal,
+          });
+        }
         if (resp.status === 404) return { result: `${cveId}: not found in NVD` };
         if (!resp.ok) return { result: `Error: NVD returned HTTP ${resp.status}` };
         const data: any = await resp.json();
@@ -3662,7 +3711,12 @@ async function executeTool(
     case "pcap_summary": {
       const filePath = asStr(args.path);
       if (!filePath) return { result: "Error: path required" };
-      const fullPath = pathLib.isAbsolute(filePath) ? filePath : pathLib.join(projectDir, filePath);
+      const fullPath = pathLib.resolve(pathLib.isAbsolute(filePath) ? filePath : pathLib.join(projectDir, filePath));
+      const projectAbs = pathLib.resolve(projectDir);
+      const tmpAbs = pathLib.resolve(require("os").tmpdir());
+      if (!fullPath.startsWith(projectAbs + pathLib.sep) && fullPath !== projectAbs && !fullPath.startsWith(tmpAbs + pathLib.sep)) {
+        return { result: `Error: pcap path must be inside the project directory or ${tmpAbs}` };
+      }
       try { await fsPromises.access(fullPath); } catch { return { result: `Error: file not found: ${filePath}` }; }
       const maxPackets = Math.min(50_000, Math.max(100, Number(args.max_packets) || 5_000));
       try {
@@ -4477,7 +4531,7 @@ For non-website RE work the senior-engineer escalation ladder is:
 The following are already on PATH — call them directly via run_command, never install_package: \`radare2\`/\`r2\`, \`strace\`, \`ltrace\`, \`binwalk\`, \`mitmproxy\`/\`mitmdump\`, \`unzip\`, \`7z\`, \`socat\`, \`nmap\`, \`tcpdump\`, \`jq\`, \`wasm2wat\`/\`wasm-objdump\`/\`wat2wasm\` (wabt), plus the always-available \`file\`, \`readelf\`, \`objdump\`, \`nm\`, \`strings\`, \`ldd\`, \`od\`, \`python3\`. Only call install_package for things genuinely missing (uncompyle6, jupyterlab, transformers, etc.).
 
 ### Knowledge / lookup tools (use these BEFORE guessing):
-- **web_search query=...** — DuckDuckGo HTML search (no API key). For unknown error messages, library docs, magic-byte references, current versions. Returns title+url+snippet for each hit; follow up with **http_request** or **browse_website** to fetch a promising result.
+- **web_search query=... [sources=github_repos,github_code,wikipedia,npm] [max_per_source=N]** — multi-source knowledge aggregator. Default sources: github_repos+wikipedia+npm. Add github_code for usage examples. Returns source-tagged hits; follow up with **http_request** or **browse_website** to fetch a promising URL. (For specific CVEs use **cve_lookup** directly — that's the canonical source.)
 - **cve_lookup cve_id=CVE-YYYY-NNNN** — pulls the official NVD record (CVSS, severity, description, CWE, references). Use any time the user mentions a CVE or you suspect a known vuln.
 - **pcap_summary path=/tmp/cap.pcap** — summarizes a tcpdump capture into top talkers / dst ports / DNS / HTTP lines. Always prefer this over dumping raw packets into chat.
 
