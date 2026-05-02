@@ -478,6 +478,9 @@ components:
           type: ["string", "null"]
         language:
           type: string
+        template:
+          type: ["string", "null"]
+          description: "Optional template id to scaffold the project (blank, vite-react, express-ts, flask-python, static-html, nextjs)"
       required:
         - name
         - language
@@ -540,6 +543,8 @@ components:
         content:
           type: string
         name:
+          type: string
+        path:
           type: string
       required:
         - content

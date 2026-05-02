@@ -12,6 +12,14 @@ export const settingsTable = pgTable("settings", {
 export const aiRequestsTable = pgTable("ai_requests", {
   id: serial("id").primaryKey(),
   projectId: integer("project_id"),
+  endpoint: text("endpoint"),
+  provider: text("provider"),
+  model: text("model"),
+  tokensIn: integer("tokens_in").notNull().default(0),
+  tokensOut: integer("tokens_out").notNull().default(0),
+  costUsd: text("cost_usd").notNull().default("0"),
+  durationMs: integer("duration_ms").notNull().default(0),
+  success: integer("success").notNull().default(1),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 

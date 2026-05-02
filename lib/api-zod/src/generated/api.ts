@@ -34,6 +34,12 @@ export const CreateProjectBody = zod.object({
   name: zod.string(),
   description: zod.string().nullish(),
   language: zod.string(),
+  template: zod
+    .string()
+    .nullish()
+    .describe(
+      "Optional template id to scaffold the project (blank, vite-react, express-ts, flask-python, static-html, nextjs)",
+    ),
 });
 
 /**
@@ -143,6 +149,7 @@ export const UpdateFileParams = zod.object({
 export const UpdateFileBody = zod.object({
   content: zod.string(),
   name: zod.string().optional(),
+  path: zod.string().optional(),
 });
 
 export const UpdateFileResponse = zod.object({

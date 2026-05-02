@@ -11,4 +11,9 @@ export interface CreateProjectBody {
   /** @nullable */
   description?: string | null;
   language: string;
+  /**
+   * Optional template id to scaffold the project (blank, vite-react, express-ts, flask-python, static-html, nextjs)
+   * @nullable
+   */
+  template?: string | null;
 }

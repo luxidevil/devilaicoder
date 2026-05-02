@@ -9,4 +9,5 @@
 export interface UpdateFileBody {
   content: string;
   name?: string;
+  path?: string;
 }

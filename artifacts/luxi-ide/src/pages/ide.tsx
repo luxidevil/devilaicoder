@@ -50,11 +50,36 @@ import {
   Server,
   Shield,
   ExternalLink,
+  History,
+  Key,
+  GitBranch,
+  Image as ImageIcon,
+  Command as CommandIcon,
+  Save as SaveIcon,
+  Sparkles,
 } from "lucide-react";
 import { Link } from "wouter";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { TerminalPanel } from "@/components/terminal";
+import { CheckpointsDialog } from "@/components/checkpoints-dialog";
+import { ProcessesPanel } from "@/components/processes-panel";
+import { ConversationsMenu } from "@/components/conversations-menu";
+import { FindingsPanel } from "@/components/findings-panel";
+import { SecretsDialog } from "@/components/secrets-dialog";
+import { GitHubDialog } from "@/components/github-dialog";
+import { DiffView } from "@/components/diff-view";
+import { CommandPalette, PaletteIcons, type PaletteAction } from "@/components/command-palette";
+import { InlineAiEdit } from "@/components/inline-ai-edit";
+import { FindInFiles } from "@/components/find-in-files";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import { toast } from "sonner";
 
 function getLanguageFromPath(path: string): string {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
@@ -92,11 +117,11 @@ function getLanguageBadgeColor(lang: string) {
 }
 
 type AgentEvent =
-  | { type: "user"; content: string }
+  | { type: "user"; content: string; images?: { mimeType: string; dataBase64: string }[] }
   | { type: "thinking"; content: string }
   | { type: "tool_call"; id: string; tool: string; args: Record<string, any> }
   | { type: "tool_result"; id: string; tool: string; result: string }
-  | { type: "file_changed"; path: string; action: string }
+  | { type: "file_changed"; path: string; action: string; before?: string; after?: string }
   | { type: "preview_port"; port: number }
   | { type: "preview_url"; url: string }
   | { type: "message"; content: string }
@@ -167,13 +192,96 @@ function getToolLabel(tool: string) {
   }
 }
 
-function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
+function TodoChecklist({ raw }: { raw: string }) {
+  let todos: { id: string; task: string; status: string }[] = [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) todos = parsed;
+  } catch {
+    return null;
+  }
+  if (!todos.length) return null;
+  const done = todos.filter((t) => t.status === "done").length;
+  const total = todos.length;
+  return (
+    <div className="my-1 space-y-1">
+      <div className="flex items-center justify-between text-[10px] text-muted-foreground font-mono">
+        <span className="uppercase tracking-wider">Plan ({done}/{total})</span>
+        <div className="flex-1 mx-2 h-0.5 bg-muted rounded overflow-hidden">
+          <div
+            className="h-full bg-gradient-brand transition-all"
+            style={{ width: `${total ? (done / total) * 100 : 0}%` }}
+          />
+        </div>
+      </div>
+      <ul className="space-y-0.5">
+        {todos.map((t) => {
+          const isDone = t.status === "done";
+          const isActive = t.status === "in_progress";
+          const isErr = t.status === "error";
+          return (
+            <li
+              key={t.id}
+              className={cn(
+                "flex items-start gap-2 text-xs px-2 py-1 rounded",
+                isActive && "bg-amber-500/10 ring-1 ring-amber-500/30",
+                isErr && "bg-red-500/10"
+              )}
+            >
+              <span
+                className={cn(
+                  "inline-flex items-center justify-center w-3.5 h-3.5 rounded-full flex-shrink-0 mt-0.5 text-[9px] font-bold",
+                  isDone && "bg-emerald-500/20 text-emerald-300",
+                  isActive && "bg-amber-500/30 text-amber-200 animate-pulse",
+                  isErr && "bg-red-500/30 text-red-200",
+                  !isDone && !isActive && !isErr && "bg-muted text-muted-foreground"
+                )}
+              >
+                {isDone ? "✓" : isActive ? "→" : isErr ? "✗" : "○"}
+              </span>
+              <span className={cn(
+                "flex-1 leading-snug",
+                isDone && "text-muted-foreground line-through",
+                isActive && "text-foreground font-medium",
+                isErr && "text-red-200"
+              )}>
+                {t.task}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
+// Heuristic: did this tool result represent a failure the user might want to fix?
+// We deliberately keep the markers tight (the agent server uses these literal
+// prefixes for run_command / install_package / shell failures) so we don't show
+// "Fix with AI" on harmless results that happen to contain the word "error".
+const FAILURE_TOOLS = new Set(["run_command", "install_package", "shell", "manage_process"]);
+const FAILURE_RE = /^(Exit \S+:|Error:|Command timed out)/;
+function detectFailure(tool: string, result?: string): boolean {
+  if (!result || !FAILURE_TOOLS.has(tool)) return false;
+  return FAILURE_RE.test(result.trimStart());
+}
+
+function ToolCallCard({ tool, args, result, isExpanded, onToggle, onFix }: {
   tool: string;
   args: Record<string, any>;
   result?: string;
   isExpanded: boolean;
   onToggle: () => void;
+  onFix?: (prompt: string) => void;
 }) {
+  // Special-case the planning tool — render as a checklist always (no need to expand)
+  if (tool === "todowrite" && typeof args.todos === "string") {
+    return (
+      <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2.5 py-1.5">
+        <TodoChecklist raw={args.todos} />
+      </div>
+    );
+  }
   const toolColor = tool === "think"
     ? "border-violet-500/30 bg-violet-500/5"
     : tool.includes("write") || tool.includes("create") || tool === "edit_file" || tool === "batch_write_files"
@@ -253,6 +361,23 @@ function ToolCallCard({ tool, args, result, isExpanded, onToggle }: {
           </pre>
         </div>
       )}
+      {onFix && detectFailure(tool, result) && (
+        <div className="px-2.5 pb-1.5 pt-0.5 flex items-center gap-2 border-t border-red-500/20 bg-red-500/5">
+          <Sparkles className="w-3 h-3 text-red-400 flex-shrink-0" />
+          <span className="text-[10px] text-red-300/80 flex-1">This {tool === "install_package" ? "install" : "command"} failed.</span>
+          <button
+            onClick={() => {
+              const cmd = (args.command as string) || (args.name as string) || tool;
+              const stderr = (result || "").slice(0, 1500);
+              onFix(`The previous \`${cmd}\` failed:\n\n\`\`\`\n${stderr}\n\`\`\`\n\nPlease diagnose the root cause and fix it.`);
+            }}
+            className="text-[10px] px-2 py-0.5 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 hover:text-red-200 transition-colors font-medium"
+            data-testid="button-fix-with-ai"
+          >
+            Fix with AI
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -319,7 +444,36 @@ export default function IDE() {
   const updateFile = useUpdateFile();
   const deleteFile = useDeleteFile();
 
-  const [selectedFileId, setSelectedFileId] = useState<number | null>(null);
+  // Multi-tab editor state. selectedFileId/setSelectedFileId are aliases over
+  // (activeTabId, openFileInTab) so all existing call sites Just Work™.
+  const [openTabs, setOpenTabs] = useState<number[]>([]);
+  const [activeTabId, setActiveTabId] = useState<number | null>(null);
+
+  const openFileInTab = useCallback((id: number | null) => {
+    if (id == null) {
+      setActiveTabId(null);
+      return;
+    }
+    setOpenTabs((tabs) => (tabs.includes(id) ? tabs : [...tabs, id]));
+    setActiveTabId(id);
+  }, []);
+
+  const closeTab = useCallback((id: number) => {
+    setOpenTabs((tabs) => {
+      const idx = tabs.indexOf(id);
+      if (idx === -1) return tabs;
+      const next = tabs.filter((t) => t !== id);
+      setActiveTabId((cur) => {
+        if (cur !== id) return cur;
+        return next[idx] ?? next[idx - 1] ?? null;
+      });
+      return next;
+    });
+  }, []);
+
+  const selectedFileId = activeTabId;
+  const setSelectedFileId = openFileInTab;
+
   const [editorContent, setEditorContent] = useState<string>("");
   const [isSaving, setIsSaving] = useState(false);
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -335,8 +489,26 @@ export default function IDE() {
   const [agentInput, setAgentInput] = useState("");
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<{ name: string; content: string }[]>([]);
+  const [attachedImages, setAttachedImages] = useState<{ name: string; mimeType: string; dataBase64: string; previewUrl: string }[]>([]);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [inlineEditOpen, setInlineEditOpen] = useState(false);
+  const [inlineEditPos, setInlineEditPos] = useState<{ top: number; left: number } | null>(null);
+  const monacoRef = useRef<any>(null);
+  const inlineEditCtxRef = useRef<{
+    selection: string;
+    range: any;
+    contextBefore: string;
+    contextAfter: string;
+  } | null>(null);
+  const editorFocusedRef = useRef(false);
+  const [renameFileId, setRenameFileId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [findOpen, setFindOpen] = useState(false);
+  const pendingJumpRef = useRef<{ fileId: number; line: number; column: number } | null>(null);
+  const selectedFileIdRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const agentBottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const agentInputRef = useRef<HTMLTextAreaElement>(null);
@@ -345,8 +517,35 @@ export default function IDE() {
   const [expandedTools, setExpandedTools] = useState<Set<number>>(new Set());
   const [conversationId, setConversationId] = useState<number | null>(null);
   const [chatLoading, setChatLoading] = useState(true);
+  const [convoListKey, setConvoListKey] = useState(0);
   const chatLoadRequestRef = useRef(0);
 
+  // Replay a conversation's messages into agentEvents. Tracks an incrementing
+  // requestId so that fast project/convo switches don't race and clobber each
+  // other (the most recent request always wins).
+  const loadConversationMessages = useCallback(async (convId: number) => {
+    setChatLoading(true);
+    const requestId = ++chatLoadRequestRef.current;
+    try {
+      const msgs: any[] = await fetch(`/api/conversations/${convId}/messages`).then(r => r.json());
+      if (requestId !== chatLoadRequestRef.current) return;
+      const events: AgentEvent[] = [];
+      for (const m of (msgs || [])) {
+        if (typeof m.role === "string" && m.role.startsWith("event:")) {
+          try { events.push(JSON.parse(m.content) as AgentEvent); } catch {}
+        } else {
+          events.push({ type: m.role === "user" ? "user" : "message", content: m.content });
+        }
+      }
+      setAgentEvents(events);
+    } catch {
+      if (requestId === chatLoadRequestRef.current) setAgentEvents([]);
+    } finally {
+      if (requestId === chatLoadRequestRef.current) setChatLoading(false);
+    }
+  }, []);
+
+  // On project switch: reset chat, then auto-open the latest conversation if any.
   useEffect(() => {
     if (!projectId) return;
     setAgentEvents([]);
@@ -355,39 +554,56 @@ export default function IDE() {
     const requestId = ++chatLoadRequestRef.current;
     fetch(`/api/projects/${projectId}/conversations`)
       .then(r => r.json())
-      .then((convos: any[]) => {
-        if (requestId !== chatLoadRequestRef.current) return [];
+      .then(async (convos: any[]) => {
+        if (requestId !== chatLoadRequestRef.current) return;
         if (convos.length > 0) {
           const latest = convos[0];
           setConversationId(latest.id);
-          return fetch(`/api/conversations/${latest.id}/messages`).then(r => r.json());
-        }
-        return [];
-      })
-      .then((msgs: any[]) => {
-        if (requestId !== chatLoadRequestRef.current) return;
-        if (msgs && msgs.length > 0) {
-          const events: AgentEvent[] = [];
-          for (const m of msgs) {
-            if (m.role.startsWith("event:")) {
-              try {
-                events.push(JSON.parse(m.content) as AgentEvent);
-              } catch {}
-            } else {
-              events.push({
-                type: m.role === "user" ? "user" : "message",
-                content: m.content,
-              });
-            }
-          }
-          setAgentEvents(events);
+          await loadConversationMessages(latest.id);
+        } else {
+          setChatLoading(false);
         }
       })
-      .catch(() => {})
-      .finally(() => {
+      .catch(() => {
         if (requestId === chatLoadRequestRef.current) setChatLoading(false);
       });
-  }, [projectId]);
+  }, [projectId, loadConversationMessages]);
+
+  // Cancel any in-flight agent stream and clear ephemeral chat UI state.
+  // Called whenever we leave the current conversation context (switch / new chat)
+  // so a background stream can't append events into the wrong convo and so
+  // hover-state (expanded tools, attachments) doesn't bleed across chats.
+  const resetEphemeralChatState = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsAgentRunning(false);
+    setExpandedTools(new Set());
+    setAttachedFiles([]);
+    setAttachedImages([]);
+  }, []);
+
+  // User-driven actions for the conversation switcher.
+  const handleSwitchConversation = useCallback(async (id: number) => {
+    if (id === conversationId) return;
+    resetEphemeralChatState();
+    setConversationId(id);
+    await loadConversationMessages(id);
+  }, [conversationId, loadConversationMessages, resetEphemeralChatState]);
+
+  const handleNewConversation = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/projects/${projectId}/conversations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "New chat" }),
+      });
+      const convo = await res.json();
+      resetEphemeralChatState();
+      setConversationId(convo.id);
+      setAgentEvents([]);
+      setConvoListKey(k => k + 1);
+    } catch {}
+  }, [projectId, resetEphemeralChatState]);
 
   const saveMessageToDb = useCallback(async (convId: number, role: string, content: string) => {
     try {
@@ -396,6 +612,8 @@ export default function IDE() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ role, content }),
       });
+      // User-visible activity → bump so the Chats menu re-orders/refreshes titles.
+      if (role === "user") setConvoListKey(k => k + 1);
     } catch {}
   }, []);
 
@@ -443,13 +661,23 @@ export default function IDE() {
   const [sshSaving, setSSHSaving] = useState(false);
   const [sshShowKey, setSSHShowKey] = useState(false);
 
+  const [showCheckpoints, setShowCheckpoints] = useState(false);
+  const [showSecrets, setShowSecrets] = useState(false);
+  const [showGitHub, setShowGitHub] = useState(false);
+
   const selectedFile = files?.find((f) => f.id === selectedFileId);
 
+  const didAutoOpenRef = useRef(false);
   useEffect(() => {
-    if (files && files.length > 0 && !selectedFileId) {
+    if (files && files.length > 0 && !selectedFileId && !didAutoOpenRef.current) {
+      didAutoOpenRef.current = true;
       setSelectedFileId(files[0].id);
     }
   }, [files, selectedFileId]);
+
+  useEffect(() => {
+    selectedFileIdRef.current = selectedFileId;
+  }, [selectedFileId]);
 
   useEffect(() => {
     if (selectedFile) {
@@ -608,12 +836,145 @@ export default function IDE() {
     );
   };
 
+  // Cmd+K / Ctrl+K — open command palette globally (skipped when editor focused, handled by Monaco)
+  // Cmd+P — open palette focused on file search
+  // Cmd+W — close active tab
+  // Cmd+Shift+[ / ] — prev/next tab
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const isMod = e.metaKey || e.ctrlKey;
+      if (isMod && e.key.toLowerCase() === "k" && !editorFocusedRef.current) {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+        return;
+      }
+      if (isMod && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        setPaletteOpen(true);
+        return;
+      }
+      if (isMod && e.key.toLowerCase() === "w") {
+        if (activeTabId != null) {
+          e.preventDefault();
+          closeTab(activeTabId);
+        }
+        return;
+      }
+      // Cmd+Shift+F — Find in files
+      if (isMod && e.shiftKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        setFindOpen((o) => !o);
+        return;
+      }
+      // F2 — rename active tab (ignore when typing in an input/textarea)
+      if (e.key === "F2") {
+        const tag = (e.target as HTMLElement | null)?.tagName;
+        const inEditable = tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement | null)?.isContentEditable;
+        if (!inEditable && activeTabId != null) {
+          const f = files?.find((x) => x.id === activeTabId);
+          if (f) {
+            e.preventDefault();
+            setRenameFileId(f.id);
+            setRenameValue(f.name);
+          }
+        }
+        return;
+      }
+      if (isMod && e.shiftKey && (e.key === "[" || e.key === "]")) {
+        if (openTabs.length > 1 && activeTabId != null) {
+          e.preventDefault();
+          const idx = openTabs.indexOf(activeTabId);
+          const dir = e.key === "]" ? 1 : -1;
+          const nextIdx = (idx + dir + openTabs.length) % openTabs.length;
+          setActiveTabId(openTabs[nextIdx]);
+        }
+        return;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeTabId, openTabs, closeTab]);
+
+  // Prune closed tabs when files are deleted server-side
+  useEffect(() => {
+    if (!files) return;
+    const valid = new Set(files.map((f) => f.id));
+    setOpenTabs((tabs) => {
+      const filtered = tabs.filter((id) => valid.has(id));
+      if (filtered.length !== tabs.length) return filtered;
+      return tabs;
+    });
+    if (activeTabId != null && !valid.has(activeTabId)) {
+      setActiveTabId(null);
+    }
+  }, [files, activeTabId]);
+
+  // Inline AI edit: ask the server for a replacement and apply it on accept
+  const fetchInlineEditReplacement = useCallback(
+    async (instruction: string): Promise<string> => {
+      const ctx = inlineEditCtxRef.current;
+      if (!ctx) throw new Error("No editor context");
+      const lang = selectedFile ? getLanguageFromPath(selectedFile.path) : "plaintext";
+      const res = await fetch("/api/ai/inline-edit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instruction,
+          selection: ctx.selection,
+          contextBefore: ctx.contextBefore,
+          contextAfter: ctx.contextAfter,
+          language: lang,
+          fileName: selectedFile?.name ?? "untitled",
+          projectId,
+        }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.error ?? `HTTP ${res.status}`);
+      }
+      const j = await res.json();
+      return j.replacement ?? "";
+    },
+    [selectedFile, projectId]
+  );
+
+  const applyInlineEdit = useCallback((replacement: string) => {
+    const ctx = inlineEditCtxRef.current;
+    const editor = editorRef.current;
+    if (!ctx || !editor) {
+      setInlineEditOpen(false);
+      return;
+    }
+    editor.executeEdits("luxi-inline-ai", [
+      { range: ctx.range, text: replacement, forceMoveMarkers: true },
+    ]);
+    editor.focus();
+    setInlineEditOpen(false);
+    inlineEditCtxRef.current = null;
+    toast.success("Edit applied");
+  }, []);
+
   const handleFileAttach = useCallback((fileList: FileList | null) => {
     if (!fileList) return;
     const maxSize = 5 * 1024 * 1024;
     Array.from(fileList).forEach((file) => {
       if (file.size > maxSize) {
         setAgentEvents((prev) => [...prev, { type: "error", content: `File "${file.name}" too large (max 5MB)` }]);
+        return;
+      }
+      // Route image MIME types to the image attachments store
+      if (/^image\/(png|jpeg|jpg|webp|gif)$/i.test(file.type)) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(",")[1] ?? "";
+          if (!base64) return;
+          setAttachedImages((prev) => [
+            ...prev,
+            { name: file.name, mimeType: file.type, dataBase64: base64, previewUrl: dataUrl },
+          ].slice(0, 8));
+        };
+        reader.readAsDataURL(file);
         return;
       }
       const reader = new FileReader();
@@ -624,6 +985,24 @@ export default function IDE() {
       reader.readAsText(file);
     });
   }, []);
+
+  const handlePasteImage = useCallback((e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageFiles: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const f = item.getAsFile();
+        if (f) imageFiles.push(f);
+      }
+    }
+    if (imageFiles.length === 0) return;
+    e.preventDefault();
+    const dt = new DataTransfer();
+    imageFiles.forEach((f) => dt.items.add(f));
+    handleFileAttach(dt.files);
+  }, [handleFileAttach]);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -660,7 +1039,17 @@ export default function IDE() {
       }).join("\n\n");
       userMessage = `${userMessage}\n\n---\nATTACHED FILES:\n${filesContext}`;
     }
+    const sentImages = attachedImages.map((img) => ({
+      mimeType: img.mimeType,
+      dataBase64: img.dataBase64,
+    }));
+    const sentImagePreviews = attachedImages.map((img) => ({
+      mimeType: img.mimeType,
+      dataBase64: img.previewUrl,
+    }));
+
     setAttachedFiles([]);
+    setAttachedImages([]);
     setAgentInput("");
     setIsAgentRunning(true);
     setExpandedTools(new Set());
@@ -674,8 +1063,12 @@ export default function IDE() {
       content: (e as any).content,
     }));
 
-    const displayContent = agentInput.trim() + (attachedFiles.length > 0 ? `\n📎 ${attachedFiles.map(f => f.name).join(", ")}` : "");
-    const userEvent: AgentEvent = { type: "user", content: displayContent };
+    const attachmentSummary = [
+      attachedFiles.length > 0 ? `📎 ${attachedFiles.map(f => f.name).join(", ")}` : "",
+      sentImages.length > 0 ? `🖼 ${sentImages.length} image${sentImages.length === 1 ? "" : "s"}` : "",
+    ].filter(Boolean).join("  ");
+    const displayContent = agentInput.trim() + (attachmentSummary ? `\n${attachmentSummary}` : "");
+    const userEvent: AgentEvent = { type: "user", content: displayContent, images: sentImagePreviews };
     setAgentEvents((prev) => [...prev, userEvent]);
 
     const convId = await getOrCreateConversation();
@@ -762,6 +1155,7 @@ export default function IDE() {
           message: userMessage,
           projectId,
           history: history.slice(-20),
+          images: sentImages,
         }),
         signal: controller.signal,
       });
@@ -852,15 +1246,17 @@ export default function IDE() {
 
   return (
     <div className="h-screen flex flex-col bg-background overflow-hidden" data-testid="ide-container">
-      <header className="h-10 flex items-center px-3 border-b border-border bg-card flex-shrink-0 gap-2">
+      <header className="h-11 flex items-center px-3 border-b border-border/70 glass-strong flex-shrink-0 gap-2">
         <Link href="/">
-          <button className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground" data-testid="button-back-home">
+          <button className="p-1.5 rounded-md hover:bg-muted/60 transition-colors text-muted-foreground hover:text-foreground" data-testid="button-back-home">
             <Home className="w-4 h-4" />
           </button>
         </Link>
         <div className="w-px h-4 bg-border" />
-        <Zap className="w-3.5 h-3.5 text-primary" />
-        <span className="text-sm font-medium text-foreground truncate max-w-xs">
+        <span className="inline-flex items-center justify-center w-6 h-6 rounded-md bg-gradient-brand glow-brand-sm">
+          <Zap className="w-3 h-3 text-white" />
+        </span>
+        <span className="text-sm font-semibold text-foreground truncate max-w-xs tracking-tight">
           {project?.name ?? "Loading..."}
         </span>
         {project?.language && (
@@ -904,6 +1300,23 @@ export default function IDE() {
             </TooltipTrigger>
             <TooltipContent>Terminal (Ctrl+`)</TooltipContent>
           </Tooltip>
+          <ProcessesPanel
+            projectId={projectId}
+            onOpenPreview={(port) => {
+              setPreviewUrl(`http://localhost:${port}`);
+              setShowPreview(true);
+              setPreviewKey((k) => k + 1);
+            }}
+          />
+          <ConversationsMenu
+            projectId={projectId}
+            currentConversationId={conversationId}
+            onSwitch={handleSwitchConversation}
+            onNew={handleNewConversation}
+            refreshKey={convoListKey}
+          />
+          <FindingsPanel projectId={projectId} />
+          {/* eslint-disable-next-line @typescript-eslint/no-unused-vars */}
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -914,6 +1327,42 @@ export default function IDE() {
               </button>
             </TooltipTrigger>
             <TooltipContent>Keyboard shortcuts</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={() => setShowCheckpoints(true)}
+                className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+                data-testid="button-checkpoints"
+              >
+                <History className="w-4 h-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Checkpoints (rollback)</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={() => setShowSecrets(true)}
+                className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+                data-testid="button-secrets"
+              >
+                <Key className="w-4 h-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>Project Secrets</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={() => setShowGitHub(true)}
+                className="p-1.5 rounded hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+                data-testid="button-github"
+              >
+                <GitBranch className="w-4 h-4" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent>GitHub (clone, push, create)</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -949,7 +1398,38 @@ export default function IDE() {
       )}
 
       <PanelGroup direction="horizontal" className="flex-1 overflow-hidden">
-        <Panel defaultSize={16} minSize={12} maxSize={30} className="border-r border-border bg-card overflow-hidden flex flex-col">
+        <Panel defaultSize={16} minSize={12} maxSize={30} className="border-r border-border bg-card overflow-hidden flex flex-col relative">
+          {findOpen && (
+            <div className="absolute inset-0 z-30">
+              <FindInFiles
+                open={findOpen}
+                onClose={() => setFindOpen(false)}
+                files={(files ?? []).map((f) => ({ id: f.id, name: f.name, path: f.path, content: f.content ?? "" }))}
+                onJump={(fileId, line, column) => {
+                  openFileInTab(fileId);
+                  setFindOpen(false);
+                  pendingJumpRef.current = { fileId, line, column };
+                  let attempts = 0;
+                  const tryJump = () => {
+                    const pending = pendingJumpRef.current;
+                    if (!pending) return;
+                    const ed = editorRef.current;
+                    if (ed && selectedFileIdRef.current === pending.fileId) {
+                      ed.revealLineInCenter(pending.line);
+                      ed.setPosition({ lineNumber: pending.line, column: pending.column });
+                      ed.focus();
+                      pendingJumpRef.current = null;
+                      return;
+                    }
+                    attempts++;
+                    if (attempts < 30) setTimeout(tryJump, 50);
+                    else pendingJumpRef.current = null;
+                  };
+                  tryJump();
+                }}
+              />
+            </div>
+          )}
           <div className="flex items-center justify-between px-3 py-2 border-b border-border">
             <div className="flex items-center gap-1.5">
               <FolderOpen className="w-3.5 h-3.5 text-primary/70" />
@@ -982,35 +1462,125 @@ export default function IDE() {
             ) : files && files.length > 0 ? (
               <div className="py-1">
                 {files.map((file) => (
-                  <div
-                    key={file.id}
-                    className={cn(
-                      "flex items-center justify-between px-3 py-1.5 group cursor-pointer hover:bg-muted/50 transition-colors",
-                      selectedFileId === file.id && "bg-primary/10 border-r-2 border-primary"
-                    )}
-                    onClick={() => {
-                      isUserEditingRef.current = false;
-                      setSelectedFileId(file.id);
-                    }}
-                    data-testid={`file-item-${file.id}`}
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <File className={cn("w-3.5 h-3.5 flex-shrink-0", selectedFileId === file.id ? "text-primary" : "text-muted-foreground")} />
-                      <span className={cn("text-xs truncate font-mono", selectedFileId === file.id ? "text-foreground" : "text-muted-foreground")}>
-                        {file.name}
-                      </span>
-                    </div>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeleteConfirmId(file.id);
-                      }}
-                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-destructive/20 hover:text-destructive transition-all text-muted-foreground"
-                      data-testid={`button-delete-file-${file.id}`}
-                    >
-                      <Trash2 className="w-3 h-3" />
-                    </button>
-                  </div>
+                  <ContextMenu key={file.id}>
+                    <ContextMenuTrigger asChild>
+                      <div
+                        className={cn(
+                          "flex items-center justify-between px-3 py-1.5 group cursor-pointer hover:bg-muted/50 transition-colors",
+                          selectedFileId === file.id && "bg-primary/10 border-r-2 border-primary"
+                        )}
+                        onClick={() => {
+                          isUserEditingRef.current = false;
+                          openFileInTab(file.id);
+                        }}
+                        onDoubleClick={() => {
+                          setRenameFileId(file.id);
+                          setRenameValue(file.name);
+                        }}
+                        data-testid={`file-item-${file.id}`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                          <File className={cn("w-3.5 h-3.5 flex-shrink-0", selectedFileId === file.id ? "text-primary" : "text-muted-foreground")} />
+                          {renameFileId === file.id ? (
+                            <input
+                              autoFocus
+                              value={renameValue}
+                              onChange={(e) => setRenameValue(e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  const newName = renameValue.trim();
+                                  if (!newName || newName === file.name) {
+                                    setRenameFileId(null);
+                                    return;
+                                  }
+                                  // Recompute path: replace last segment of file.path with newName
+                                  const segs = file.path.split("/");
+                                  segs[segs.length - 1] = newName;
+                                  const newPath = segs.join("/");
+                                  updateFile.mutate(
+                                    {
+                                      projectId,
+                                      fileId: file.id,
+                                      data: { content: file.content, name: newName, path: newPath },
+                                    },
+                                    {
+                                      onSuccess: () => {
+                                        queryClient.invalidateQueries({ queryKey: getListFilesQueryKey(projectId) });
+                                        toast.success(`Renamed to ${newName}`);
+                                        setRenameFileId(null);
+                                      },
+                                      onError: (err: any) => {
+                                        toast.error(`Rename failed: ${err?.message ?? "unknown"}`);
+                                        setRenameFileId(null);
+                                      },
+                                    }
+                                  );
+                                } else if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  setRenameFileId(null);
+                                }
+                              }}
+                              onBlur={() => setRenameFileId(null)}
+                              className="text-xs font-mono bg-background border border-primary/40 rounded px-1.5 py-0.5 min-w-0 flex-1 outline-none focus:ring-1 focus:ring-primary"
+                              data-testid={`input-rename-${file.id}`}
+                            />
+                          ) : (
+                            <span className={cn("text-xs truncate font-mono", selectedFileId === file.id ? "text-foreground" : "text-muted-foreground")}>
+                              {file.name}
+                            </span>
+                          )}
+                        </div>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDeleteConfirmId(file.id);
+                          }}
+                          className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-destructive/20 hover:text-destructive transition-all text-muted-foreground"
+                          data-testid={`button-delete-file-${file.id}`}
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </ContextMenuTrigger>
+                    <ContextMenuContent className="w-48">
+                      <ContextMenuItem onSelect={() => openFileInTab(file.id)}>
+                        <File className="w-3.5 h-3.5 mr-2" /> Open
+                      </ContextMenuItem>
+                      <ContextMenuItem onSelect={() => { setRenameFileId(file.id); setRenameValue(file.name); }}>
+                        <FileEdit className="w-3.5 h-3.5 mr-2" /> Rename
+                        <span className="ml-auto text-[10px] text-muted-foreground font-mono">F2</span>
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onSelect={() => {
+                          navigator.clipboard.writeText(file.path).then(
+                            () => toast.success("Path copied"),
+                            () => toast.error("Copy failed")
+                          );
+                        }}
+                      >
+                        <Copy className="w-3.5 h-3.5 mr-2" /> Copy path
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onSelect={() => {
+                          navigator.clipboard.writeText(file.content ?? "").then(
+                            () => toast.success("Contents copied"),
+                            () => toast.error("Copy failed")
+                          );
+                        }}
+                      >
+                        <Copy className="w-3.5 h-3.5 mr-2" /> Copy contents
+                      </ContextMenuItem>
+                      <ContextMenuSeparator />
+                      <ContextMenuItem
+                        onSelect={() => setDeleteConfirmId(file.id)}
+                        className="text-destructive focus:text-destructive"
+                      >
+                        <Trash2 className="w-3.5 h-3.5 mr-2" /> Delete
+                      </ContextMenuItem>
+                    </ContextMenuContent>
+                  </ContextMenu>
                 ))}
               </div>
             ) : (
@@ -1033,22 +1603,107 @@ export default function IDE() {
               <div className="flex-1 flex flex-col min-h-0">
                 <PanelGroup direction="horizontal" className="flex-1">
                   <Panel defaultSize={showPreview ? 50 : 100} minSize={20} className="flex flex-col min-h-0">
-                    {selectedFile ? (
+                    {openTabs.length > 0 || selectedFile ? (
                       <>
-                        <div className="flex items-center h-9 px-3 border-b border-border bg-card gap-2 flex-shrink-0">
-                          <span className={cn("text-[10px] font-mono px-1.5 py-0.5 rounded", getLanguageBadgeColor(editorLanguage))}>
-                            {editorLanguage}
-                          </span>
-                          <span className="text-xs text-muted-foreground font-mono">{selectedFile.path}</span>
+                        {/* Tab strip */}
+                        <div className="flex items-center h-9 border-b border-border bg-card overflow-x-auto scrollbar-thin flex-shrink-0">
+                          {openTabs.map((tabId) => {
+                            const tabFile = files?.find((f) => f.id === tabId);
+                            if (!tabFile) return null;
+                            const isActive = tabId === activeTabId;
+                            return (
+                              <div
+                                key={tabId}
+                                onClick={() => setActiveTabId(tabId)}
+                                onMouseDown={(e) => {
+                                  // Middle-click closes the tab
+                                  if (e.button === 1) {
+                                    e.preventDefault();
+                                    closeTab(tabId);
+                                  }
+                                }}
+                                className={cn(
+                                  "group/tab flex items-center gap-2 px-3 h-full border-r border-border cursor-pointer transition-colors flex-shrink-0 max-w-[200px]",
+                                  isActive
+                                    ? "bg-background text-foreground border-b-2 border-b-primary -mb-px"
+                                    : "text-muted-foreground hover:text-foreground hover:bg-muted/40"
+                                )}
+                                data-testid={`tab-${tabId}`}
+                                title={tabFile.path}
+                              >
+                                <File className={cn("w-3 h-3 flex-shrink-0", isActive && "text-primary")} />
+                                <span className="text-xs font-mono truncate">{tabFile.name}</span>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    closeTab(tabId);
+                                  }}
+                                  className={cn(
+                                    "p-0.5 rounded hover:bg-muted-foreground/20 transition-all",
+                                    isActive ? "opacity-60" : "opacity-0 group-hover/tab:opacity-60"
+                                  )}
+                                  data-testid={`button-close-tab-${tabId}`}
+                                >
+                                  <X className="w-3 h-3" />
+                                </button>
+                              </div>
+                            );
+                          })}
+                          {selectedFile && (
+                            <div className="flex items-center gap-2 px-3 ml-auto flex-shrink-0">
+                              <span className={cn("text-[10px] font-mono px-1.5 py-0.5 rounded", getLanguageBadgeColor(editorLanguage))}>
+                                {editorLanguage}
+                              </span>
+                              {isSaving ? (
+                                <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />
+                              ) : (
+                                <Check className="w-3 h-3 text-emerald-400/70" />
+                              )}
+                            </div>
+                          )}
                         </div>
-                        <div className="flex-1 overflow-hidden">
-                          <Editor
-                            height="100%"
-                            theme="vs-dark"
-                            language={editorLanguage}
-                            value={editorContent}
-                            onChange={handleEditorChange}
-                            onMount={(editor) => { editorRef.current = editor; }}
+                        <div className="flex-1 overflow-hidden relative">
+                          {selectedFile ? (
+                            <Editor
+                              height="100%"
+                              theme="vs-dark"
+                              language={editorLanguage}
+                              value={editorContent}
+                              onChange={handleEditorChange}
+                              onMount={(editor, monaco) => {
+                                editorRef.current = editor;
+                                monacoRef.current = monaco;
+                                editor.onDidFocusEditorWidget(() => { editorFocusedRef.current = true; });
+                                editor.onDidBlurEditorWidget(() => { editorFocusedRef.current = false; });
+                                // Cmd+K / Ctrl+K — inline AI edit on selection
+                                editor.addCommand(
+                                  monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK,
+                                  () => {
+                                    const sel = editor.getSelection();
+                                    const model = editor.getModel();
+                                    if (!sel || !model) return;
+                                    const selectionText = model.getValueInRange(sel);
+                                    const fullText = model.getValue();
+                                    const startOffset = model.getOffsetAt({ lineNumber: sel.startLineNumber, column: sel.startColumn });
+                                    const endOffset = model.getOffsetAt({ lineNumber: sel.endLineNumber, column: sel.endColumn });
+                                    inlineEditCtxRef.current = {
+                                      selection: selectionText,
+                                      range: sel,
+                                      contextBefore: fullText.slice(Math.max(0, startOffset - 4000), startOffset),
+                                      contextAfter: fullText.slice(endOffset, endOffset + 4000),
+                                    };
+                                    // Position the prompt under the selection
+                                    const coords = editor.getScrolledVisiblePosition({
+                                      lineNumber: sel.endLineNumber,
+                                      column: 1,
+                                    });
+                                    setInlineEditPos(
+                                      coords ? { top: coords.top + coords.height + 8, left: 16 } : { top: 16, left: 16 }
+                                    );
+                                    setInlineEditOpen(true);
+                                  }
+                                );
+                              }}
                             loading={
                               <div className="flex items-center justify-center h-full gap-2 text-muted-foreground">
                                 <Loader2 className="w-5 h-5 animate-spin" />
@@ -1078,6 +1733,19 @@ export default function IDE() {
                               parameterHints: { enabled: true },
                             }}
                           />
+                          ) : (
+                            <div className="flex-1 flex items-center justify-center text-center p-8 h-full">
+                              <div className="text-xs text-muted-foreground">Loading file...</div>
+                            </div>
+                          )}
+                          <InlineAiEdit
+                            open={inlineEditOpen}
+                            onCancel={() => { setInlineEditOpen(false); inlineEditCtxRef.current = null; }}
+                            onApply={applyInlineEdit}
+                            fetchReplacement={fetchInlineEditReplacement}
+                            anchorTop={inlineEditPos?.top}
+                            anchorLeft={inlineEditPos?.left}
+                          />
                         </div>
                       </>
                     ) : (
@@ -1086,8 +1754,8 @@ export default function IDE() {
                           <div className="w-16 h-16 bg-muted rounded-full flex items-center justify-center mx-auto mb-4">
                             <File className="w-8 h-8 text-muted-foreground" />
                           </div>
-                          <h3 className="text-sm font-medium text-muted-foreground mb-2">No file selected</h3>
-                          <p className="text-xs text-muted-foreground/60 mb-4">Select a file from the sidebar or ask the agent to build something.</p>
+                          <h3 className="text-sm font-medium text-muted-foreground mb-2">No file open</h3>
+                          <p className="text-xs text-muted-foreground/60 mb-4">Select a file from the sidebar, press <kbd className="font-mono text-[10px] px-1 py-0.5 rounded bg-muted">⌘P</kbd> to search, or ask the agent to build something.</p>
                           <Button size="sm" variant="outline" onClick={() => setShowNewFileDialog(true)} className="text-xs">
                             <FilePlus className="w-3 h-3 mr-1" />
                             New file
@@ -1255,18 +1923,20 @@ export default function IDE() {
               </div>
             ) : agentEvents.length === 0 ? (
               <div className="text-center py-8">
-                <div className="w-14 h-14 rounded-full bg-primary/10 border border-primary/20 flex items-center justify-center mx-auto mb-4">
-                  {chatMode === "agent" ? <Bot className="text-primary w-6 h-6" /> : <MessageCircle className="text-primary w-6 h-6" />}
+                <div className="relative w-16 h-16 rounded-2xl bg-gradient-brand glow-brand flex items-center justify-center mx-auto mb-5 animate-float-soft">
+                  {chatMode === "agent" ? <Bot className="text-white w-7 h-7 drop-shadow-[0_2px_4px_rgba(0,0,0,0.4)]" /> : <MessageCircle className="text-white w-7 h-7 drop-shadow-[0_2px_4px_rgba(0,0,0,0.4)]" />}
+                  <span className="pointer-events-none absolute inset-0 rounded-2xl ring-1 ring-white/20" />
                 </div>
-                <p className="text-sm font-medium text-foreground mb-1">
-                  {chatMode === "agent" ? "Luxi Agent" : "Luxi Chat"}
+                <p className="text-base font-semibold tracking-tight mb-1">
+                  <span className="text-gradient-brand">Luxi</span>{" "}
+                  <span className="text-foreground">{chatMode === "agent" ? "Agent" : "Chat"}</span>
                 </p>
                 <p className="text-xs text-muted-foreground mb-1">
                   {chatMode === "agent"
                     ? "I can read, write, and edit your code. Run commands. Build anything."
                     : "Ask me anything about code, architecture, or your project."}
                 </p>
-                <p className="text-xs text-muted-foreground mb-4">
+                <p className="text-[11px] text-muted-foreground/80 mb-5">
                   {chatMode === "agent"
                     ? "Drop HAR/JSON/CSV files to analyze and recreate."
                     : "I'll answer questions without modifying your code."}
@@ -1290,7 +1960,7 @@ export default function IDE() {
                     <button
                       key={suggestion}
                       onClick={() => { setAgentInput(suggestion); agentInputRef.current?.focus(); }}
-                      className="block w-full text-left text-xs px-3 py-1.5 rounded border border-border/60 hover:border-primary/40 hover:bg-primary/5 transition-colors text-muted-foreground hover:text-foreground"
+                      className="group/sug block w-full text-left text-xs px-3 py-2 rounded-md border border-border/60 hover:border-primary/50 hover:bg-primary/5 transition-all text-muted-foreground hover:text-foreground hover:shadow-[0_0_0_1px_hsl(var(--primary)/0.25)]"
                     >
                       {suggestion}
                     </button>
@@ -1311,8 +1981,20 @@ export default function IDE() {
                           <div className="w-5 h-5 rounded-full bg-primary/20 flex items-center justify-center flex-shrink-0 mt-0.5">
                             <User className="w-3 h-3 text-primary" />
                           </div>
-                          <div className="flex-1 bg-primary/10 border border-primary/20 rounded-lg px-3 py-2 text-[13px] text-foreground">
-                            {event.content}
+                          <div className="flex-1 bg-primary/10 border border-primary/20 rounded-lg px-3 py-2 text-[13px] text-foreground space-y-2">
+                            <div className="whitespace-pre-wrap">{event.content}</div>
+                            {Array.isArray((event as any).images) && (event as any).images.length > 0 && (
+                              <div className="flex flex-wrap gap-2 pt-1">
+                                {(event as any).images.map((img: any, k: number) => (
+                                  <img
+                                    key={k}
+                                    src={img.dataBase64}
+                                    alt={`upload-${k}`}
+                                    className="max-h-32 rounded border border-border/60 object-contain bg-background/40"
+                                  />
+                                ))}
+                              </div>
+                            )}
                           </div>
                         </div>
                       );
@@ -1347,6 +2029,11 @@ export default function IDE() {
                             result={resultEvent?.result}
                             isExpanded={expandedTools.has(currentIndex)}
                             onToggle={() => toggleToolExpand(currentIndex)}
+                            onFix={(prompt) => {
+                              setAgentInput(prompt);
+                              agentInputRef.current?.focus();
+                              agentInputRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+                            }}
                           />
                         </motion.div>
                       );
@@ -1355,7 +2042,26 @@ export default function IDE() {
                     case "tool_result":
                       return null;
 
-                    case "file_changed":
+                    case "file_changed": {
+                      const hasDiff =
+                        typeof (event as any).before === "string" &&
+                        typeof (event as any).after === "string";
+                      if (hasDiff) {
+                        return (
+                          <motion.div
+                            key={i}
+                            initial={{ opacity: 0, y: 4 }}
+                            animate={{ opacity: 1, y: 0 }}
+                          >
+                            <DiffView
+                              before={(event as any).before ?? ""}
+                              after={(event as any).after ?? ""}
+                              path={event.path}
+                              action={event.action}
+                            />
+                          </motion.div>
+                        );
+                      }
                       return (
                         <motion.div
                           key={i}
@@ -1368,6 +2074,7 @@ export default function IDE() {
                           <span className="text-foreground font-mono text-[11px]">{event.path}</span>
                         </motion.div>
                       );
+                    }
 
                     case "preview_port":
                       return (
@@ -1466,12 +2173,39 @@ export default function IDE() {
                 ))}
               </div>
             )}
+            {attachedImages.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mb-1.5">
+                {attachedImages.map((img, i) => (
+                  <div key={i} className="relative group">
+                    <img
+                      src={img.previewUrl}
+                      alt={img.name}
+                      className="h-12 w-12 rounded border border-primary/30 object-cover"
+                    />
+                    <button
+                      onClick={() => setAttachedImages((prev) => prev.filter((_, j) => j !== i))}
+                      className="absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full w-3.5 h-3.5 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <X className="w-2.5 h-2.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="flex gap-2">
               <input
                 ref={fileInputRef}
                 type="file"
                 multiple
                 accept=".har,.json,.csv,.xml,.yaml,.yml,.toml,.env,.txt,.html,.css,.js,.ts,.tsx,.jsx,.py,.rs,.go,.sh,.sql,.md,.log,.conf,.cfg,.ini"
+                className="hidden"
+                onChange={(e) => { handleFileAttach(e.target.files); e.target.value = ""; }}
+              />
+              <input
+                ref={imageInputRef}
+                type="file"
+                multiple
+                accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
                 className="hidden"
                 onChange={(e) => { handleFileAttach(e.target.files); e.target.value = ""; }}
               />
@@ -1489,10 +2223,26 @@ export default function IDE() {
                 </TooltipTrigger>
                 <TooltipContent side="top">Attach files (HAR, JSON, CSV...)</TooltipContent>
               </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 w-8 p-0 flex-shrink-0 text-muted-foreground hover:text-primary"
+                    onClick={() => imageInputRef.current?.click()}
+                    disabled={isAgentRunning}
+                    data-testid="button-attach-image"
+                  >
+                    <ImageIcon className="w-4 h-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Attach image (or paste / drop)</TooltipContent>
+              </Tooltip>
               <textarea
                 ref={agentInputRef}
                 value={agentInput}
                 onChange={(e) => setAgentInput(e.target.value)}
+                onPaste={handlePasteImage}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
@@ -1701,6 +2451,44 @@ export default function IDE() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <CheckpointsDialog
+        open={showCheckpoints}
+        onOpenChange={setShowCheckpoints}
+        projectId={projectId}
+        onRestored={() => {
+          queryClient.invalidateQueries({ queryKey: getListFilesQueryKey(projectId) });
+          isUserEditingRef.current = false;
+        }}
+      />
+      <SecretsDialog open={showSecrets} onOpenChange={setShowSecrets} projectId={projectId} />
+      <GitHubDialog
+        open={showGitHub}
+        onOpenChange={setShowGitHub}
+        projectId={projectId}
+        onCloned={() => {
+          queryClient.invalidateQueries({ queryKey: getListFilesQueryKey(projectId) });
+          isUserEditingRef.current = false;
+        }}
+      />
+
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        files={(files ?? []).map((f) => ({ id: f.id, name: f.name, path: f.path, language: f.language }))}
+        onOpenFile={(f) => openFileInTab(f.id)}
+        actions={[
+          { id: "new-file", label: "New file", icon: PaletteIcons.FilePlus, run: () => setShowNewFileDialog(true) },
+          { id: "find-in-files", label: "Find in files", icon: Search, shortcut: "⌘⇧F", run: () => setFindOpen(true) },
+          { id: "save-file", label: "Save current file", icon: PaletteIcons.Save, shortcut: "⌘S", run: () => flushSave(editorContent) },
+          { id: "checkpoints", label: "Checkpoints", icon: PaletteIcons.History, run: () => setShowCheckpoints(true) },
+          { id: "secrets", label: "Project secrets", icon: PaletteIcons.Lock, run: () => setShowSecrets(true) },
+          { id: "github", label: "GitHub", icon: PaletteIcons.Github, run: () => setShowGitHub(true) },
+          { id: "shortcuts", label: "Keyboard shortcuts", icon: PaletteIcons.Cog, run: () => setShowShortcuts(true) },
+          { id: "preview", label: showPreview ? "Hide preview" : "Show preview", icon: PaletteIcons.Play, run: () => setShowPreview((s) => !s) },
+          { id: "home", label: "Back to dashboard", icon: PaletteIcons.HomeIcon, run: () => setLocation("/") },
+        ]}
+      />
     </div>
   );
 }

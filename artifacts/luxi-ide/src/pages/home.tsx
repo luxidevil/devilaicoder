@@ -7,12 +7,13 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { format } from "date-fns";
-import { Plus, Terminal, Code2, ArrowRight } from "lucide-react";
+import { Plus, Terminal, ArrowRight, Check, Sparkles, Zap } from "lucide-react";
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { Skeleton } from "@/components/ui/skeleton";
+import { PROJECT_TEMPLATES } from "@/lib/templates";
+import { cn } from "@/lib/utils";
 
 export default function Home() {
   const { data: projects, isLoading } = useListProjects();
@@ -23,14 +24,17 @@ export default function Home() {
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [language, setLanguage] = useState("typescript");
+  const [templateId, setTemplateId] = useState("blank");
 
   const handleCreate = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
 
+    const template = PROJECT_TEMPLATES.find((t) => t.id === templateId);
+    const language = template?.language ?? "typescript";
+
     createProject.mutate(
-      { data: { name, description, language } },
+      { data: { name, description, language, template: templateId } as any },
       {
         onSuccess: (newProject) => {
           queryClient.invalidateQueries({ queryKey: getListProjectsQueryKey() });
@@ -42,67 +46,98 @@ export default function Home() {
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-background selection:bg-primary/30">
+    <div className="min-h-screen flex flex-col bg-mesh selection:bg-primary/30 relative">
+      <div className="pointer-events-none absolute inset-x-0 top-14 h-[420px] grid-pattern opacity-60" />
       <Navbar />
-      
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
-        <div className="flex items-center justify-between mb-8">
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight">Your Projects</h1>
-            <p className="text-muted-foreground text-sm mt-1">Select a workspace to start coding.</p>
+
+      <main className="relative flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
+        <section className="relative mb-10 mt-2">
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-primary/30 bg-primary/10 text-primary text-[11px] font-medium mb-4">
+            <Sparkles className="w-3 h-3" />
+            <span>AI-native coding workspace</span>
           </div>
-          
-          <Dialog open={open} onOpenChange={setOpen}>
-            <DialogTrigger asChild>
-              <Button data-testid="button-new-project">
-                <Plus className="w-4 h-4 mr-2" />
-                New Project
-              </Button>
-            </DialogTrigger>
-            <DialogContent className="sm:max-w-[425px]">
+          <div className="flex items-end justify-between gap-6 flex-wrap">
+            <div className="max-w-2xl">
+              <h1 className="text-3xl sm:text-4xl font-bold tracking-tight">
+                Your <span className="text-gradient-brand">Projects</span>
+              </h1>
+              <p className="text-muted-foreground text-base mt-2 leading-relaxed">
+                Pick a workspace to keep building, or spin up a new one. Your AI agent reads, writes,
+                runs, and ships — all from a single chat.
+              </p>
+            </div>
+
+            <Dialog open={open} onOpenChange={setOpen}>
+              <DialogTrigger asChild>
+                <button
+                  data-testid="button-new-project"
+                  className="btn-brand inline-flex items-center justify-center gap-2 h-11 px-5 rounded-lg font-semibold text-sm"
+                >
+                  <Plus className="w-4 h-4" />
+                  New Project
+                </button>
+              </DialogTrigger>
+            <DialogContent className="sm:max-w-[640px]">
               <form onSubmit={handleCreate}>
                 <DialogHeader>
                   <DialogTitle>Create new project</DialogTitle>
                   <DialogDescription>
-                    Set up a new coding environment with AI assistance.
+                    Pick a starter template or start blank — the AI agent helps either way.
                   </DialogDescription>
                 </DialogHeader>
                 <div className="grid gap-4 py-4 mt-2">
                   <div className="grid gap-2">
                     <Label htmlFor="name">Project Name</Label>
-                    <Input 
-                      id="name" 
-                      placeholder="e.g. My Awesome App" 
-                      value={name} 
-                      onChange={(e) => setName(e.target.value)} 
+                    <Input
+                      id="name"
+                      placeholder="e.g. My Awesome App"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
                       data-testid="input-project-name"
                       autoFocus
                     />
                   </div>
                   <div className="grid gap-2">
                     <Label htmlFor="description">Description (optional)</Label>
-                    <Input 
-                      id="description" 
-                      placeholder="Brief description of your project" 
-                      value={description} 
-                      onChange={(e) => setDescription(e.target.value)} 
+                    <Input
+                      id="description"
+                      placeholder="Brief description of your project"
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
                       data-testid="input-project-description"
                     />
                   </div>
                   <div className="grid gap-2">
-                    <Label htmlFor="language">Language</Label>
-                    <Select value={language} onValueChange={setLanguage}>
-                      <SelectTrigger id="language" data-testid="select-language">
-                        <SelectValue placeholder="Select a language" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="typescript">TypeScript</SelectItem>
-                        <SelectItem value="javascript">JavaScript</SelectItem>
-                        <SelectItem value="python">Python</SelectItem>
-                        <SelectItem value="rust">Rust</SelectItem>
-                        <SelectItem value="go">Go</SelectItem>
-                      </SelectContent>
-                    </Select>
+                    <Label>Template</Label>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      {PROJECT_TEMPLATES.map((t) => {
+                        const Icon = t.icon;
+                        const selected = templateId === t.id;
+                        return (
+                          <button
+                            type="button"
+                            key={t.id}
+                            onClick={() => setTemplateId(t.id)}
+                            className={cn(
+                              "relative text-left rounded-lg border p-3 transition-all hover:border-primary/60",
+                              selected
+                                ? "border-primary bg-primary/5 shadow-[0_0_0_1px_var(--primary)]"
+                                : "border-border bg-card/40"
+                            )}
+                            data-testid={`template-${t.id}`}
+                          >
+                            {selected && (
+                              <Check className="absolute top-1.5 right-1.5 w-3.5 h-3.5 text-primary" />
+                            )}
+                            <Icon className={cn("w-5 h-5 mb-1.5", t.color)} />
+                            <div className="text-sm font-medium">{t.name}</div>
+                            <div className="text-[11px] text-muted-foreground line-clamp-2 mt-0.5">
+                              {t.description}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
                 </div>
                 <DialogFooter>
@@ -113,7 +148,8 @@ export default function Home() {
               </form>
             </DialogContent>
           </Dialog>
-        </div>
+          </div>
+        </section>
 
         {isLoading ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -133,33 +169,46 @@ export default function Home() {
             ))}
           </div>
         ) : projects && projects.length > 0 ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
             {projects.map((project, idx) => (
               <motion.div
                 key={project.id}
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: idx * 0.05 }}
+                transition={{ delay: idx * 0.04, duration: 0.35 }}
               >
                 <Link href={`/projects/${project.id}`}>
-                  <Card className="h-full hover:border-primary/50 transition-colors cursor-pointer group bg-card hover:bg-card/80 border-border" data-testid={`card-project-${project.id}`}>
+                  <Card
+                    className="card-glow h-full cursor-pointer group bg-card/80 border-border/70 backdrop-blur-sm overflow-hidden relative"
+                    data-testid={`card-project-${project.id}`}
+                  >
+                    <div className="pointer-events-none absolute -top-px left-4 right-4 h-px bg-gradient-to-r from-transparent via-primary/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity" />
                     <CardHeader className="pb-3">
-                      <div className="flex items-start justify-between">
-                        <CardTitle className="text-lg group-hover:text-primary transition-colors flex items-center gap-2">
-                          <Terminal className="w-4 h-4 text-muted-foreground" />
-                          {project.name}
+                      <div className="flex items-start justify-between gap-3">
+                        <CardTitle className="text-lg flex items-center gap-2 min-w-0">
+                          <span className="inline-flex items-center justify-center w-7 h-7 rounded-md bg-primary/10 text-primary border border-primary/20 shrink-0">
+                            <Terminal className="w-3.5 h-3.5" />
+                          </span>
+                          <span className="truncate group-hover:text-gradient-brand transition-colors">
+                            {project.name}
+                          </span>
                         </CardTitle>
-                        <span className="text-xs px-2 py-1 rounded-full bg-secondary text-secondary-foreground font-mono">
+                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-secondary text-secondary-foreground font-mono uppercase tracking-wider border border-border/60 shrink-0">
                           {project.language}
                         </span>
                       </div>
-                      <CardDescription className="line-clamp-2 min-h-[2.5rem]">
+                      <CardDescription className="line-clamp-2 min-h-[2.5rem] mt-2">
                         {project.description || "No description provided."}
                       </CardDescription>
                     </CardHeader>
                     <CardFooter className="text-xs text-muted-foreground pt-4 flex items-center justify-between border-t border-border/50">
-                      <span>Updated {format(new Date(project.updatedAt), "MMM d, yyyy")}</span>
-                      <ArrowRight className="w-4 h-4 opacity-0 group-hover:opacity-100 transition-opacity text-primary" />
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500/80 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
+                        Updated {format(new Date(project.updatedAt), "MMM d, yyyy")}
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-primary opacity-0 group-hover:opacity-100 translate-x-[-4px] group-hover:translate-x-0 transition-all">
+                        Open <ArrowRight className="w-3.5 h-3.5" />
+                      </span>
                     </CardFooter>
                   </Card>
                 </Link>
@@ -167,18 +216,25 @@ export default function Home() {
             ))}
           </div>
         ) : (
-          <div className="flex flex-col items-center justify-center py-24 text-center border border-dashed border-border rounded-xl bg-card/30">
-            <div className="w-16 h-16 bg-secondary rounded-full flex items-center justify-center mb-6">
-              <Code2 className="w-8 h-8 text-primary" />
+          <div className="relative flex flex-col items-center justify-center py-24 text-center rounded-2xl glass overflow-hidden">
+            <div className="pointer-events-none absolute inset-0 grid-pattern opacity-40" />
+            <div className="relative w-20 h-20 rounded-2xl bg-gradient-brand glow-brand flex items-center justify-center mb-6 animate-float-soft">
+              <Zap className="w-9 h-9 text-white drop-shadow-[0_2px_6px_rgba(0,0,0,0.4)]" />
             </div>
-            <h2 className="text-xl font-semibold mb-2">No projects yet</h2>
-            <p className="text-muted-foreground max-w-md mb-8">
-              Welcome to Luxi. Create your first project to start coding with the power of Gemini AI right inside your editor.
+            <h2 className="relative text-2xl font-semibold mb-2 tracking-tight">
+              Welcome to <span className="text-gradient-brand">LUXI</span>
+            </h2>
+            <p className="relative text-muted-foreground max-w-md mb-8 leading-relaxed">
+              Your AI coding partner. Spin up a project and tell the agent what to build —
+              it reads, writes, runs, and ships.
             </p>
-            <Button onClick={() => setOpen(true)}>
-              <Plus className="w-4 h-4 mr-2" />
+            <button
+              onClick={() => setOpen(true)}
+              className="btn-brand inline-flex items-center justify-center gap-2 h-11 px-6 rounded-lg font-semibold text-sm"
+            >
+              <Plus className="w-4 h-4" />
               Create First Project
-            </Button>
+            </button>
           </div>
         )}
       </main>

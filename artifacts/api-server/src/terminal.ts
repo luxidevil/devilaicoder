@@ -11,13 +11,35 @@ let activeSessions = 0;
 function validateOrigin(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
   const host = req.headers.host;
-  if (!origin) return true;
+  // Fail closed: missing Origin is rejected (auth is mandatory anyway, but defense in depth)
+  if (!origin) return false;
   try {
     const originHost = new URL(origin).host;
     return originHost === host;
   } catch {
     return false;
   }
+}
+
+function checkAdminAuth(req: IncomingMessage, url: URL): boolean {
+  const expected = process.env.ADMIN_CREDS || "LUXI:LUXI";
+  // Accept Authorization header
+  const auth = req.headers["authorization"];
+  if (typeof auth === "string" && auth.startsWith("Basic ")) {
+    try {
+      const decoded = Buffer.from(auth.slice("Basic ".length), "base64").toString("utf-8");
+      if (decoded === expected) return true;
+    } catch { /* fallthrough */ }
+  }
+  // Browser WebSocket() can't set custom headers — allow ?token=base64(user:pass) as fallback
+  const token = url.searchParams.get("token");
+  if (token) {
+    try {
+      const decoded = Buffer.from(token, "base64").toString("utf-8");
+      if (decoded === expected) return true;
+    } catch { /* fallthrough */ }
+  }
+  return false;
 }
 
 export function setupTerminalWebSocket(server: Server): void {
@@ -29,6 +51,13 @@ export function setupTerminalWebSocket(server: Server): void {
       if (!validateOrigin(req)) {
         logger.warn("Terminal WebSocket rejected: invalid origin");
         socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+
+      if (!checkAdminAuth(req, url)) {
+        logger.warn("Terminal WebSocket rejected: unauthorized");
+        socket.write("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"LUXI IDE\"\r\n\r\n");
         socket.destroy();
         return;
       }

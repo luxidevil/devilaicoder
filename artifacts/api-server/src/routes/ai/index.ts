@@ -8,6 +8,11 @@ import {
   invalidateSettingsCache as _invalidate,
 } from "../../lib/ai-providers";
 
+// Rough character→token estimate for streaming (no usage in stream payload)
+function estimateTokens(text: string): number {
+  return Math.ceil((text?.length ?? 0) / 4);
+}
+
 const router: IRouter = Router();
 
 export function invalidateSettingsCache() {
@@ -51,6 +56,106 @@ function buildProjectContext(
   return ctx;
 }
 
+// Inline editor edit (Cmd+K inside Monaco): take a selection + instruction,
+// return ONLY the replacement code. Synchronous JSON, no streaming, no tools.
+router.post("/ai/inline-edit", async (req, res): Promise<void> => {
+  const { instruction, selection, language, fileName, contextBefore, contextAfter, projectId } =
+    req.body as {
+      instruction: string;
+      selection: string;
+      language?: string;
+      fileName?: string;
+      contextBefore?: string;
+      contextAfter?: string;
+      projectId?: number;
+    };
+
+  if (!instruction || typeof instruction !== "string") {
+    res.status(400).json({ error: "instruction is required" });
+    return;
+  }
+  if (typeof selection !== "string") {
+    res.status(400).json({ error: "selection is required (may be empty string)" });
+    return;
+  }
+  if (instruction.length > 4000 || selection.length > 80_000) {
+    res.status(413).json({ error: "instruction or selection too large" });
+    return;
+  }
+
+  const settings = await getActiveProvider();
+  if (!settings) {
+    res.status(503).json({ error: "AI not configured. Add an API key in the admin panel." });
+    return;
+  }
+
+  const startedAt = Date.now();
+  const lang = language || "plaintext";
+  const before = (contextBefore ?? "").slice(-4000);
+  const after = (contextAfter ?? "").slice(0, 4000);
+
+  const systemPrompt = `You are an inline code editor. The user selects code in their editor and gives a single instruction. You return ONLY the replacement code — no prose, no markdown fences, no commentary. Preserve indentation style and surrounding context exactly. If the selection is empty, return code to insert at the cursor.`;
+
+  const userPrompt = `File: ${fileName ?? "untitled"}
+Language: ${lang}
+
+--- CONTEXT BEFORE SELECTION ---
+${before}
+--- SELECTED CODE (replace this) ---
+${selection}
+--- CONTEXT AFTER SELECTION ---
+${after}
+---
+
+Instruction: ${instruction}
+
+Return ONLY the new code to replace the selection. No backticks. No explanation.`;
+
+  try {
+    const stream = await streamChat(settings, systemPrompt, [{ role: "user", content: userPrompt }]);
+    const reader = stream.getReader();
+    let out = "";
+    let streamErr: string | null = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value?.text) out += value.text;
+      if (value?.error) streamErr = value.error;
+      if (value?.done) break;
+    }
+
+    // Strip a leading/trailing fenced code block if the model insists
+    let replacement = out.trim();
+    const fence = replacement.match(/^```[\w-]*\n([\s\S]*?)\n```$/);
+    if (fence) replacement = fence[1];
+
+    const tokensIn = estimateTokens(systemPrompt) + estimateTokens(userPrompt);
+    const tokensOut = estimateTokens(out);
+    const { computeCostUsd } = await import("../../lib/ai-providers");
+    const costUsd = computeCostUsd(settings.model, tokensIn, tokensOut);
+    db.insert(aiRequestsTable).values({
+      projectId: projectId ?? null,
+      endpoint: "/ai/inline-edit",
+      provider: settings.provider,
+      model: settings.model,
+      tokensIn,
+      tokensOut,
+      costUsd: costUsd.toFixed(8),
+      durationMs: Date.now() - startedAt,
+      success: streamErr ? 0 : 1,
+    }).catch(() => {});
+
+    if (streamErr) {
+      res.status(502).json({ error: streamErr });
+      return;
+    }
+    res.json({ replacement });
+  } catch (err: any) {
+    logger.error({ err }, "inline-edit error");
+    res.status(500).json({ error: err?.message ?? "Internal error" });
+  }
+});
+
 router.post("/ai/chat", async (req, res): Promise<void> => {
   const { message, projectId, history, fileContext, fileName, allFiles, mode } = req.body as {
     message: string;
@@ -79,8 +184,7 @@ router.post("/ai/chat", async (req, res): Promise<void> => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
-  db.insert(aiRequestsTable).values({ projectId: projectId ?? null }).catch(() => {});
-
+  const startedAt = Date.now();
   let aborted = false;
   const abortController = new AbortController();
 
@@ -135,18 +239,40 @@ Build fast. Build right. No compromises.`;
     const stream = await streamChat(settings, systemPrompt, chatMessages, abortController.signal);
     const reader = stream.getReader();
 
+    let outputText = "";
+    let streamError = false;
+
     while (true) {
       if (aborted) break;
       const { done, value } = await reader.read();
       if (done) break;
       if (value?.text && !aborted) {
+        outputText += value.text;
         res.write(`data: ${JSON.stringify({ content: value.text })}\n\n`);
       }
       if (value?.error && !aborted) {
+        streamError = true;
         res.write(`data: ${JSON.stringify({ error: value.error })}\n\n`);
       }
       if (value?.done) break;
     }
+
+    // Estimate usage (streamChat doesn't expose token counts)
+    const tokensIn = estimateTokens(systemPrompt) + estimateTokens(chatMessages.map((m) => m.content).join("\n"));
+    const tokensOut = estimateTokens(outputText);
+    const { computeCostUsd } = await import("../../lib/ai-providers");
+    const costUsd = computeCostUsd(settings.model, tokensIn, tokensOut);
+    db.insert(aiRequestsTable).values({
+      projectId: projectId ?? null,
+      endpoint: "/ai/chat",
+      provider: settings.provider,
+      model: settings.model,
+      tokensIn,
+      tokensOut,
+      costUsd: costUsd.toFixed(8),
+      durationMs: Date.now() - startedAt,
+      success: streamError ? 0 : 1,
+    }).catch(() => {});
 
     if (!aborted) {
       res.write(`data: ${JSON.stringify({ done: true })}\n\n`);

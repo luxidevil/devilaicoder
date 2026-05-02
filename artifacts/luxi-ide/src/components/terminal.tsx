@@ -75,7 +75,10 @@ export function TerminalPanel({ isOpen, onClose, onToggleMaximize, isMaximized, 
     }, 50);
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/api/ws/terminal`;
+    const token = (() => {
+      try { return localStorage.getItem("luxi.adminAuth") || ""; } catch { return ""; }
+    })();
+    const wsUrl = `${protocol}//${window.location.host}/api/ws/terminal${token ? `?token=${encodeURIComponent(token)}` : ""}`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
