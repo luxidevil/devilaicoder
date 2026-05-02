@@ -1056,6 +1056,29 @@ const toolDeclarations: ToolDeclaration[] = [
     },
   },
   {
+    name: "index_codebase",
+    description: "Build (or refresh) the semantic index for the current project so semantic_search works. Walks the project, chunks each text file (~200 lines, 30-line overlap), embeds each chunk via Gemini text-embedding-004, and stores 768-dim vectors in pgvector. Incremental by default (only re-embeds changed chunks via sha-16 of chunk text). Use once per project, then again after significant edits. Skips node_modules/.git/build/binaries/lockfiles. Requires Gemini API key configured in settings (free tier covers thousands of files).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        full: { type: "BOOLEAN", description: "If true, re-embed everything ignoring the existing sha cache. Default false (incremental)." },
+        path_prefix: { type: "STRING", description: "Optional subpath to limit indexing to (e.g. 'src/lib'). Useful for huge monorepos." },
+      },
+    },
+  },
+  {
+    name: "semantic_search",
+    description: "Find code semantically related to a natural-language query (Cursor-style). Returns top-k chunks with file path, line range, similarity score (0-1), and a 600-char preview. Use BEFORE grep when looking for concepts, behaviors, or 'where do we do X' — grep only matches literal strings, semantic_search matches MEANING. Run `index_codebase` first if the query returns nothing.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        query: { type: "STRING", description: "Natural-language description of what you're looking for, e.g. 'where do we validate the user session', 'place that handles file uploads', 'retry logic with backoff'." },
+        k: { type: "NUMBER", description: "Number of hits (default 8, max 50)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "web_search",
     description: "Multi-source knowledge search: aggregates GitHub repositories, GitHub code search, Wikipedia, and npm registry into one ranked result list. Use for: looking up libraries, finding example code, getting concept definitions, finding similar projects, and anything that needs fresh public knowledge. Returns source-tagged hits with title + URL + snippet. Follow up with http_request or browse_website to fetch a promising link. (For specific CVEs use cve_lookup directly.)",
     parameters: {
@@ -2319,32 +2342,6 @@ async function executeTool(
       }
     }
 
-    case "web_search": {
-      const query = args.query as string;
-      try {
-        const response = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
-          headers: { "User-Agent": "Luxi-Agent/1.0" }, signal: AbortSignal.timeout(10_000),
-        });
-        const html = await response.text();
-        const results: { title: string; url: string; snippet: string }[] = [];
-        const blocks = html.split(/class="result__body"/);
-        for (let i = 1; i < Math.min(blocks.length, 11); i++) {
-          const b = blocks[i];
-          const titleMatch = b.match(/class="result__a"[^>]*>([^<]+)</);
-          const urlMatch = b.match(/href="([^"]+)"/);
-          const snippetMatch = b.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/);
-          if (titleMatch && urlMatch) {
-            let rUrl = urlMatch[1];
-            if (rUrl.includes("uddg=")) { const d = decodeURIComponent(rUrl.split("uddg=")[1]?.split("&")[0] ?? ""); if (d) rUrl = d; }
-            results.push({ title: titleMatch[1].replace(/<[^>]+>/g, "").trim(), url: rUrl, snippet: snippetMatch ? snippetMatch[1].replace(/<[^>]+>/g, "").trim() : "" });
-          }
-        }
-        if (results.length === 0) return { result: `No results for "${query}".` };
-        return { result: results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join("\n\n") };
-      } catch (err: any) {
-        return { result: `Search error: ${err.message}` };
-      }
-    }
 
     case "playwright_run": {
       const url = (args.url as string ?? "").trim();
@@ -3562,6 +3559,52 @@ async function executeTool(
       return { result: out.join("\n\n") || "(no inspection output)" };
     }
 
+    case "index_codebase": {
+      try {
+        const { indexProject } = await import("../../lib/embeddings");
+        const r = await indexProject(projectId, projectDir, {
+          full: !!args.full,
+          pathPrefix: args.path_prefix ? asStr(args.path_prefix) : undefined,
+        });
+        const lines = [
+          `Indexed in ${r.durationMs}ms`,
+          `  scanned files: ${r.scannedFiles}`,
+          `  embedded chunks: ${r.indexedChunks}`,
+          `  unchanged (cached): ${r.unchanged}`,
+          `  skipped (binary/large/empty): ${r.skippedFiles}`,
+        ];
+        if (r.errors.length) lines.push(`  errors (${r.errors.length}, first 5):`, ...r.errors.slice(0, 5).map(e => `    - ${e}`));
+        return { result: lines.join("\n") };
+      } catch (err: any) {
+        return { result: `Error: ${err.message}` };
+      }
+    }
+
+    case "semantic_search": {
+      const query = asStr(args.query).trim();
+      if (!query) return { result: "Error: query required" };
+      const k = Math.max(1, Math.min(50, Number(args.k) || 8));
+      try {
+        const { searchProject, projectEmbeddingStats } = await import("../../lib/embeddings");
+        const stats = await projectEmbeddingStats(projectId);
+        if (stats.chunks === 0) {
+          return { result: "No semantic index for this project yet. Run `index_codebase` first." };
+        }
+        const hits = await searchProject(projectId, query, k);
+        if (!hits.length) return { result: `(no semantic hits for "${query}"; index has ${stats.chunks} chunks across ${stats.files} files)` };
+        const out = [`Semantic search: "${query}"  (top ${hits.length} of ${stats.chunks} chunks)`];
+        for (let i = 0; i < hits.length; i++) {
+          const h = hits[i];
+          out.push(`\n${i + 1}. ${h.filePath}:${h.startLine}-${h.endLine}  (similarity ${h.similarity.toFixed(3)})`);
+          const previewLines = h.preview.split("\n").slice(0, 12).map(l => `   ${l}`).join("\n");
+          out.push(previewLines);
+        }
+        return { result: out.join("\n") };
+      } catch (err: any) {
+        return { result: `Error: ${err.message}` };
+      }
+    }
+
     case "web_search": {
       const query = asStr(args.query).trim();
       if (!query) return { result: "Error: query required" };
@@ -4529,6 +4572,10 @@ For non-website RE work the senior-engineer escalation ladder is:
 
 ### Pre-installed toolchain (DO NOT re-install):
 The following are already on PATH — call them directly via run_command, never install_package: \`radare2\`/\`r2\`, \`strace\`, \`ltrace\`, \`binwalk\`, \`mitmproxy\`/\`mitmdump\`, \`unzip\`, \`7z\`, \`socat\`, \`nmap\`, \`tcpdump\`, \`jq\`, \`wasm2wat\`/\`wasm-objdump\`/\`wat2wasm\` (wabt), plus the always-available \`file\`, \`readelf\`, \`objdump\`, \`nm\`, \`strings\`, \`ldd\`, \`od\`, \`python3\`. Only call install_package for things genuinely missing (uncompyle6, jupyterlab, transformers, etc.).
+
+### Semantic codebase search (use BEFORE grep for conceptual questions):
+- **index_codebase [full=true] [path_prefix=...]** — builds or refreshes the pgvector embedding index for this project (Gemini text-embedding-004, 768 dims, 200-line chunks). Incremental by default. Run once per fresh project, plus a quick refresh after large edit waves.
+- **semantic_search query="..." [k=8]** — returns top-k chunks ranked by cosine similarity to the query embedding. Always prefer this over grep when the user asks "where do we do X" / "find the auth logic" / "what handles uploads" — grep matches strings, this matches MEANING. Run index_codebase first if it says "no index yet".
 
 ### Knowledge / lookup tools (use these BEFORE guessing):
 - **web_search query=... [sources=github_repos,github_code,wikipedia,npm] [max_per_source=N]** — multi-source knowledge aggregator. Default sources: github_repos+wikipedia+npm. Add github_code for usage examples. Returns source-tagged hits; follow up with **http_request** or **browse_website** to fetch a promising URL. (For specific CVEs use **cve_lookup** directly — that's the canonical source.)
