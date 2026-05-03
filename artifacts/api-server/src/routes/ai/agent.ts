@@ -588,17 +588,6 @@ const toolDeclarations: ToolDeclaration[] = [
     },
   },
   {
-    name: "web_search",
-    description: "Search the web using a search query and return top results with titles, URLs, and snippets.",
-    parameters: {
-      type: "OBJECT",
-      properties: {
-        query: { type: "STRING", description: "The search query" },
-      },
-      required: ["query"],
-    },
-  },
-  {
     name: "git_operation",
     description: "Perform git operations in the project directory: clone, init, add, commit, push, pull, status, log, branch, checkout, diff, etc.",
     parameters: {
