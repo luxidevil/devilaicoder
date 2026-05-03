@@ -296,6 +296,113 @@ export async function indexProject(
   return result;
 }
 
+/**
+ * Re-index a single file (and prune any stale chunks for it). Used by the
+ * post-write debounced reindexer so the index stays warm as the agent edits.
+ */
+export async function indexProjectFile(
+  projectId: number,
+  projectDir: string,
+  relPath: string
+): Promise<{ chunks: number; skipped: boolean; reason?: string }> {
+  await ensureEmbeddingSchema();
+  const safeRel = relPath.replace(/^\/+/, "");
+  if (safeRel.includes("..")) return { chunks: 0, skipped: true, reason: "path escapes project" };
+  if (SKIP_BASENAMES.has(pathLib.basename(safeRel))) return { chunks: 0, skipped: true, reason: "skipped basename" };
+  if (SKIP_EXT.has(pathLib.extname(safeRel).toLowerCase())) return { chunks: 0, skipped: true, reason: "skipped ext" };
+  for (const part of safeRel.split("/")) if (SKIP_DIRS.has(part)) return { chunks: 0, skipped: true, reason: "skipped dir" };
+
+  const fullPath = pathLib.join(projectDir, safeRel);
+  let buf: Buffer;
+  try {
+    const stat = await fsPromises.stat(fullPath);
+    if (!stat.isFile()) {
+      // File deleted or not regular: drop all its chunks.
+      await db.execute(sql`DELETE FROM file_embeddings WHERE project_id = ${projectId} AND file_path = ${safeRel}`);
+      return { chunks: 0, skipped: true, reason: "not a regular file" };
+    }
+    if (stat.size === 0 || stat.size > MAX_FILE_BYTES) {
+      await db.execute(sql`DELETE FROM file_embeddings WHERE project_id = ${projectId} AND file_path = ${safeRel}`);
+      return { chunks: 0, skipped: true, reason: "empty or too large" };
+    }
+    buf = await fsPromises.readFile(fullPath);
+  } catch {
+    // File gone — drop chunks.
+    await db.execute(sql`DELETE FROM file_embeddings WHERE project_id = ${projectId} AND file_path = ${safeRel}`);
+    return { chunks: 0, skipped: true, reason: "read failed (likely deleted)" };
+  }
+  if (!isLikelyText(buf)) return { chunks: 0, skipped: true, reason: "binary content" };
+
+  const content = buf.toString("utf8");
+  const chunks = chunkFileContent(safeRel, content);
+  const existingRows = await db.execute<{ chunk_idx: number; content_sha: string }>(
+    sql`SELECT chunk_idx, content_sha FROM file_embeddings WHERE project_id = ${projectId} AND file_path = ${safeRel}`
+  );
+  const existing = new Map<number, string>();
+  for (const r of existingRows.rows as any[]) existing.set(Number(r.chunk_idx), r.content_sha);
+
+  const toEmbed: FileChunk[] = chunks.filter((c) => existing.get(c.chunkIdx) !== c.sha);
+  if (toEmbed.length) {
+    let vecs: number[][];
+    try { vecs = await embedTexts(toEmbed.map((c) => c.text)); }
+    catch (e: any) { logger.warn({ err: e.message, file: safeRel }, "single-file embed failed"); return { chunks: 0, skipped: true, reason: e.message }; }
+    for (let i = 0; i < toEmbed.length; i++) {
+      const c = toEmbed[i];
+      const v = vecs[i];
+      if (!v || v.length !== EMBED_DIM) continue;
+      const preview = c.text.slice(0, 600).replace(/\u0000/g, "");
+      await db.execute(sql`
+        DELETE FROM file_embeddings
+        WHERE project_id = ${projectId} AND file_path = ${safeRel} AND chunk_idx = ${c.chunkIdx}
+      `);
+      await db.execute(sql`
+        INSERT INTO file_embeddings (project_id, file_path, chunk_idx, start_line, end_line, content_sha, content_preview, embedding, model, updated_at)
+        VALUES (${projectId}, ${safeRel}, ${c.chunkIdx}, ${c.startLine}, ${c.endLine}, ${c.sha}, ${preview}, ${vecLiteral(v)}::vector, ${EMBED_MODEL}, now())
+      `);
+    }
+  }
+
+  // Drop chunk slots that no longer exist (file shrank).
+  const validIdxs = new Set(chunks.map((c) => c.chunkIdx));
+  for (const idx of existing.keys()) {
+    if (!validIdxs.has(idx)) {
+      await db.execute(sql`
+        DELETE FROM file_embeddings WHERE project_id = ${projectId} AND file_path = ${safeRel} AND chunk_idx = ${idx}
+      `);
+    }
+  }
+  return { chunks: chunks.length, skipped: false };
+}
+
+// Per-project debouncer — coalesces post-write reindex bursts.
+const reindexQueues = new Map<number, { paths: Set<string>; timer: NodeJS.Timeout; projectDir: string }>();
+const REINDEX_DEBOUNCE_MS = 4000;
+
+export function scheduleFileReindex(projectId: number, projectDir: string, relPath: string): void {
+  if (!relPath) return;
+  let q = reindexQueues.get(projectId);
+  if (!q) {
+    q = { paths: new Set(), timer: setTimeout(() => {}, 0), projectDir };
+    clearTimeout(q.timer);
+    reindexQueues.set(projectId, q);
+  }
+  q.paths.add(relPath.replace(/^\/+/, ""));
+  q.projectDir = projectDir;
+  clearTimeout(q.timer);
+  q.timer = setTimeout(async () => {
+    const queued = reindexQueues.get(projectId);
+    if (!queued) return;
+    const paths = Array.from(queued.paths);
+    queued.paths.clear();
+    for (const p of paths) {
+      try { await indexProjectFile(projectId, queued.projectDir, p); }
+      catch (err: any) { logger.warn({ err: err.message, file: p, projectId }, "debounced reindex failed"); }
+    }
+  }, REINDEX_DEBOUNCE_MS);
+  // Don't keep the event loop alive just for this.
+  if (typeof q.timer.unref === "function") q.timer.unref();
+}
+
 export interface SearchHit {
   filePath: string;
   startLine: number;

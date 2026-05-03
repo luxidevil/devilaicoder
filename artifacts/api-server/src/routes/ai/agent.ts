@@ -4801,7 +4801,13 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
               result: compacted.length > 800 ? compacted.slice(0, 800) + "..." : compacted,
             });
 
-            if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
+            if (fileChanged) {
+              sendEvent({ type: "file_changed", ...fileChanged });
+              try {
+                const { scheduleFileReindex } = await import("../../lib/embeddings");
+                scheduleFileReindex(projectId, projectDir, fileChanged.path);
+              } catch { /* embeddings optional */ }
+            }
             if (verifiedListening) deployEligible = true;
             if (previewPort) {
               // Auto-deploy ONLY when the port was actually verified-listening
@@ -4848,7 +4854,13 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
               result: compacted.length > 800 ? compacted.slice(0, 800) + "..." : compacted,
             });
 
-            if (fileChanged) sendEvent({ type: "file_changed", ...fileChanged });
+            if (fileChanged) {
+              sendEvent({ type: "file_changed", ...fileChanged });
+              try {
+                const { scheduleFileReindex } = await import("../../lib/embeddings");
+                scheduleFileReindex(projectId, projectDir, fileChanged.path);
+              } catch { /* embeddings optional */ }
+            }
             if (verifiedListening) deployEligible = true;
             if (previewPort) {
               // Auto-deploy ONLY when the port was actually verified-listening

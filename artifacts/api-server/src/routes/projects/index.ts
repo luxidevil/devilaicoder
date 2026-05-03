@@ -223,6 +223,69 @@ router.delete("/projects/:id/processes/:name", async (req, res): Promise<void> =
   res.sendStatus(204);
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// Wave 10 — Semantic codebase search: index + stats + search endpoints.
+// All three resolve the project's on-disk dir from PROJECTS_ROOT.
+// ─────────────────────────────────────────────────────────────────────
+function projectDirFor(projectId: number): string {
+  return pathLib.join(PROJECTS_ROOT, String(projectId));
+}
+
+// Background fire-and-forget. Accepts {full?, path_prefix?}, returns 202 immediately
+// with the index stats snapshot (so the UI can show "indexing… X chunks so far").
+router.post("/projects/:id/index", async (req, res): Promise<void> => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid project id" }); return; }
+  const [project] = await db.select().from(projectsTable).where(eq(projectsTable.id, id));
+  if (!project) { res.status(404).json({ error: "Project not found" }); return; }
+  const dir = projectDirFor(id);
+  try { await fs.access(dir); } catch { res.status(404).json({ error: "Project directory missing" }); return; }
+  const { full, path_prefix } = (req.body ?? {}) as { full?: boolean; path_prefix?: string };
+  // Run in background so the request doesn't hold open for minutes on first index.
+  (async () => {
+    try {
+      const { indexProject } = await import("../../lib/embeddings");
+      const r = await indexProject(id, dir, { full: !!full, pathPrefix: path_prefix });
+      req.log.info({ projectId: id, ...r }, "background index complete");
+    } catch (err: any) {
+      req.log.warn({ projectId: id, err: err.message }, "background index failed");
+    }
+  })();
+  const { projectEmbeddingStats } = await import("../../lib/embeddings");
+  let stats = { chunks: 0, files: 0, lastUpdated: null as string | null };
+  try { stats = await projectEmbeddingStats(id); } catch { /* schema may not exist yet */ }
+  res.status(202).json({ status: "indexing", stats });
+});
+
+router.get("/projects/:id/index/stats", async (req, res): Promise<void> => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid project id" }); return; }
+  try {
+    const { projectEmbeddingStats } = await import("../../lib/embeddings");
+    const stats = await projectEmbeddingStats(id);
+    res.json(stats);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/projects/:id/search", async (req, res): Promise<void> => {
+  const id = Number(req.params.id);
+  if (!id) { res.status(400).json({ error: "Invalid project id" }); return; }
+  const { query, k } = (req.body ?? {}) as { query?: string; k?: number };
+  const q = String(query ?? "").trim();
+  if (!q) { res.status(400).json({ error: "query is required" }); return; }
+  try {
+    const { searchProject, projectEmbeddingStats } = await import("../../lib/embeddings");
+    const stats = await projectEmbeddingStats(id);
+    if (stats.chunks === 0) { res.json({ hits: [], stats, hint: "Index is empty — POST /index first." }); return; }
+    const hits = await searchProject(id, q, Math.max(1, Math.min(50, Number(k) || 10)));
+    res.json({ hits, stats });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.delete("/projects/:id", async (req, res): Promise<void> => {
   const params = DeleteProjectParams.safeParse(req.params);
   if (!params.success) {

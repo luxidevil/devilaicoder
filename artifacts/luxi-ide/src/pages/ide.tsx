@@ -66,6 +66,7 @@ import { CheckpointsDialog } from "@/components/checkpoints-dialog";
 import { ProcessesPanel } from "@/components/processes-panel";
 import { ConversationsMenu } from "@/components/conversations-menu";
 import { FindingsPanel } from "@/components/findings-panel";
+import { CodebasePanel } from "@/components/codebase-panel";
 import { SecretsDialog } from "@/components/secrets-dialog";
 import { GitHubDialog } from "@/components/github-dialog";
 import { DiffView } from "@/components/diff-view";
@@ -669,6 +670,15 @@ export default function IDE() {
 
   const didAutoOpenRef = useRef(false);
   useEffect(() => {
+    // Auto-trigger semantic index on first project open (Wave 10).
+    // Fire-and-forget — server returns 202 immediately and indexes in background.
+    if (projectId && files && files.length > 0 && !didAutoOpenRef.current) {
+      fetch(`/api/projects/${projectId}/index`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }).catch(() => { /* best-effort */ });
+    }
     if (files && files.length > 0 && !selectedFileId && !didAutoOpenRef.current) {
       didAutoOpenRef.current = true;
       setSelectedFileId(files[0].id);
@@ -1316,6 +1326,13 @@ export default function IDE() {
             refreshKey={convoListKey}
           />
           <FindingsPanel projectId={projectId} />
+          <CodebasePanel
+            projectId={projectId}
+            onOpenFile={(path) => {
+              const f = files?.find((x) => x.path === path);
+              if (f) setSelectedFileId(f.id);
+            }}
+          />
           {/* eslint-disable-next-line @typescript-eslint/no-unused-vars */}
           <Tooltip>
             <TooltipTrigger asChild>
