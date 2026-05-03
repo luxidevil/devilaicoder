@@ -49,6 +49,17 @@ router.post("/projects/:projectId/integrations", async (req, res): Promise<void>
     res.status(400).json({ error: "slug, name, kind, credential are required" });
     return;
   }
+  // SSRF guard: a stored baseUrl is later concatenated by integration_fetch and
+  // submitted to assertPublicUrl. We reject obviously-internal URLs at write time
+  // too so a confused admin can't smuggle 169.254.169.254 / 127.0.0.1 / ::1 here.
+  if (baseUrl) {
+    const lower = String(baseUrl).toLowerCase();
+    if (!/^https?:\/\//.test(lower)) { res.status(400).json({ error: "baseUrl must start with http(s)://" }); return; }
+    if (/(?:^|\/\/)(localhost|127\.|0\.0\.0\.0|169\.254\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|\[?::1\]?|\[?fc|\[?fd)/i.test(lower)) {
+      res.status(400).json({ error: "baseUrl points to a private/loopback/metadata range — refused" });
+      return;
+    }
+  }
   try {
     const i = await createIntegration({
       projectId, slug, name, kind: kind as IntegrationKind, credential,
