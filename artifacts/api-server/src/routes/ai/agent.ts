@@ -4572,6 +4572,20 @@ async function executeTool(
     case "task_create": {
       const title = asStr(args.title).trim();
       if (!title) return { result: "Error: title required" };
+      const VALID_STATUS = new Set(["todo","in_progress","done","blocked","cancelled"]);
+      const VALID_PRIORITY = new Set(["P0","P1","P2","P3"]);
+      let status: any;
+      if (args.status !== undefined) {
+        const s = asStr(args.status);
+        if (!VALID_STATUS.has(s)) return { result: `Error: status must be one of: ${Array.from(VALID_STATUS).join(", ")}` };
+        status = s;
+      }
+      let priority: any;
+      if (args.priority !== undefined) {
+        const p = asStr(args.priority);
+        if (!VALID_PRIORITY.has(p)) return { result: `Error: priority must be one of: P0, P1, P2, P3` };
+        priority = p;
+      }
       const { createTask } = await import("../../lib/tasks");
       let blockedBy: number[] = [];
       if (args.blocked_by) {
@@ -4582,8 +4596,7 @@ async function executeTool(
         const t = await createTask({
           projectId, title,
           description: args.description ? asStr(args.description) : undefined,
-          status: args.status ? asStr(args.status) as any : undefined,
-          priority: args.priority ? asStr(args.priority) as any : undefined,
+          status, priority,
           blockedBy,
           tags: args.tags ? asStr(args.tags) : undefined,
         });
@@ -4594,6 +4607,20 @@ async function executeTool(
     case "task_update": {
       const id = Number(args.id);
       if (!Number.isFinite(id) || id <= 0) return { result: "Error: id required (number)" };
+      const VALID_STATUS = new Set(["todo","in_progress","done","blocked","cancelled"]);
+      const VALID_PRIORITY = new Set(["P0","P1","P2","P3"]);
+      let status: any;
+      if (args.status !== undefined) {
+        const s = asStr(args.status);
+        if (!VALID_STATUS.has(s)) return { result: `Error: status must be one of: ${Array.from(VALID_STATUS).join(", ")}` };
+        status = s;
+      }
+      let priority: any;
+      if (args.priority !== undefined) {
+        const p = asStr(args.priority);
+        if (!VALID_PRIORITY.has(p)) return { result: `Error: priority must be one of: P0, P1, P2, P3` };
+        priority = p;
+      }
       const { updateTask } = await import("../../lib/tasks");
       let blockedBy: number[] | undefined;
       if (args.blocked_by !== undefined) {
@@ -4605,8 +4632,7 @@ async function executeTool(
           projectId, taskId: id,
           title: args.title !== undefined ? asStr(args.title) : undefined,
           description: args.description !== undefined ? asStr(args.description) : undefined,
-          status: args.status ? asStr(args.status) as any : undefined,
-          priority: args.priority ? asStr(args.priority) as any : undefined,
+          status, priority,
           blockedBy,
           tags: args.tags !== undefined ? asStr(args.tags) : undefined,
         });
@@ -4617,7 +4643,13 @@ async function executeTool(
 
     case "task_list": {
       const { listTasks, taskStats } = await import("../../lib/tasks");
-      const status = args.status ? asStr(args.status) as any : undefined;
+      let status: any;
+      if (args.status !== undefined) {
+        const s = asStr(args.status);
+        const VALID = new Set(["todo","in_progress","done","blocked","cancelled"]);
+        if (!VALID.has(s)) return { result: `Error: status must be one of: ${Array.from(VALID).join(", ")}` };
+        status = s;
+      }
       const limit = Math.max(1, Math.min(500, Number(args.limit) || 100));
       try {
         const tasks = await listTasks(projectId, { status, limit });

@@ -1,4 +1,6 @@
 import { Router, type IRouter } from "express";
+import { eq } from "drizzle-orm";
+import { db, projectsTable } from "@workspace/db";
 import { logger } from "../../lib/logger";
 import { createTask, listTasks, updateTask, deleteTask, taskStats, ensureTasksSchema } from "../../lib/tasks";
 
@@ -9,9 +11,21 @@ function pid(req: any): number | null {
   return Number.isFinite(id) && id > 0 ? id : null;
 }
 
-router.get("/projects/:projectId/tasks", async (req, res): Promise<void> => {
+async function projectExists(projectId: number): Promise<boolean> {
+  const rows = await db.select({ id: projectsTable.id }).from(projectsTable).where(eq(projectsTable.id, projectId)).limit(1);
+  return rows.length > 0;
+}
+
+async function requireProject(req: any, res: any): Promise<number | null> {
   const projectId = pid(req);
-  if (!projectId) { res.status(400).json({ error: "invalid projectId" }); return; }
+  if (!projectId) { res.status(400).json({ error: "invalid projectId" }); return null; }
+  if (!(await projectExists(projectId))) { res.status(404).json({ error: "project not found" }); return null; }
+  return projectId;
+}
+
+router.get("/projects/:projectId/tasks", async (req, res): Promise<void> => {
+  const projectId = await requireProject(req, res);
+  if (!projectId) return;
   try {
     await ensureTasksSchema();
     const status = (req.query.status as string) || undefined;
@@ -22,8 +36,8 @@ router.get("/projects/:projectId/tasks", async (req, res): Promise<void> => {
 });
 
 router.post("/projects/:projectId/tasks", async (req, res): Promise<void> => {
-  const projectId = pid(req);
-  if (!projectId) { res.status(400).json({ error: "invalid projectId" }); return; }
+  const projectId = await requireProject(req, res);
+  if (!projectId) return;
   const { title, description, status, priority, blockedBy, tags } = req.body ?? {};
   if (!title || typeof title !== "string") { res.status(400).json({ error: "title required" }); return; }
   try {
@@ -37,9 +51,10 @@ router.post("/projects/:projectId/tasks", async (req, res): Promise<void> => {
 });
 
 router.patch("/projects/:projectId/tasks/:taskId", async (req, res): Promise<void> => {
-  const projectId = pid(req);
+  const projectId = await requireProject(req, res);
+  if (!projectId) return;
   const taskId = Number(req.params.taskId);
-  if (!projectId || !Number.isFinite(taskId)) { res.status(400).json({ error: "invalid id" }); return; }
+  if (!Number.isFinite(taskId)) { res.status(400).json({ error: "invalid taskId" }); return; }
   const { title, description, status, priority, blockedBy, tags } = req.body ?? {};
   try {
     const t = await updateTask({
@@ -53,9 +68,10 @@ router.patch("/projects/:projectId/tasks/:taskId", async (req, res): Promise<voi
 });
 
 router.delete("/projects/:projectId/tasks/:taskId", async (req, res): Promise<void> => {
-  const projectId = pid(req);
+  const projectId = await requireProject(req, res);
+  if (!projectId) return;
   const taskId = Number(req.params.taskId);
-  if (!projectId || !Number.isFinite(taskId)) { res.status(400).json({ error: "invalid id" }); return; }
+  if (!Number.isFinite(taskId)) { res.status(400).json({ error: "invalid taskId" }); return; }
   try {
     const ok = await deleteTask(projectId, taskId);
     if (!ok) { res.status(404).json({ error: "not found" }); return; }
