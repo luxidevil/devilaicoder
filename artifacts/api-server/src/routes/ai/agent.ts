@@ -1056,6 +1056,50 @@ const toolDeclarations: ToolDeclaration[] = [
     },
   },
   {
+    name: "har_analyze",
+    description: "Parse a HAR (HTTP Archive) file and return a structured summary: total entries, unique hosts, status breakdown, slowest N, failures (4xx/5xx) with body previews, redirects, largest responses, detected auth (Bearer/Basic/Cookie/CSRF), and cookie names. Use FIRST whenever the user uploads/mentions a HAR file or asks to debug what a browser was doing. Path must be inside projectDir or /tmp.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        har_path: { type: "STRING", description: "Path to the .har file (project-relative or absolute under /tmp)." },
+        top_n: { type: "NUMBER", description: "How many slowest/failed/biggest entries to return (default 8, max 50)." },
+      },
+      required: ["har_path"],
+    },
+  },
+  {
+    name: "har_replay",
+    description: "Replay HTTP requests from a HAR file from the SERVER (using fetch) and report status diffs vs the original capture. Use to reproduce intermittent API failures, verify the API is still broken, or test against a different backend by setting base_url_override. Forbidden hop-by-hop headers (host, content-length, connection, etc.) are stripped automatically; cookies/auth headers are preserved. Returns up to max_requests results with originalStatus, replayStatus, durationMs, and a body diff preview when responses differ.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        har_path: { type: "STRING", description: "Path to the .har file." },
+        filter: { type: "STRING", description: "Which entries to replay: 'all' (default), 'failed' (status>=400), or 'non-2xx'." },
+        indices: { type: "STRING", description: "Optional JSON array of specific entry indices to replay, e.g. '[3, 7, 12]'. Overrides filter if set." },
+        max_requests: { type: "NUMBER", description: "Cap on requests replayed (default 25, max 100)." },
+        per_request_timeout_ms: { type: "NUMBER", description: "Per-request timeout (default 15000, max 60000)." },
+        base_url_override: { type: "STRING", description: "If set, replay against this origin instead of the original (e.g. 'https://staging.example.com'). Path/query are preserved." },
+        extra_headers: { type: "STRING", description: "Optional JSON object of headers to inject on every replayed request, e.g. '{\"Authorization\":\"Bearer NEW\"}' for token rotation." },
+      },
+      required: ["har_path"],
+    },
+  },
+  {
+    name: "har_to_playwright",
+    description: "Generate a Playwright .spec.ts file under tests/ that mimics the captured flow: optional page.goto() to the first HTML document + sequential request.fetch()/get/post/etc with status assertions for each XHR/fetch entry. Dominant Authorization/CSRF/User-Agent headers are extracted into a shared extraHeaders map. Use to convert a one-off HAR capture into a permanent regression test or to give the user a runnable repro of a browser session.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        har_path: { type: "STRING", description: "Path to the .har file." },
+        name: { type: "STRING", description: "Base filename for the generated spec (default 'har-replay'). A timestamp is appended." },
+        include_navigation: { type: "BOOLEAN", description: "Include page.goto() for the first HTML document entry (default true)." },
+        all_resource_types: { type: "BOOLEAN", description: "Include images/css/fonts in addition to xhr/fetch (default false)." },
+        max_requests: { type: "NUMBER", description: "Cap on requests emitted (default 50, max 200)." },
+      },
+      required: ["har_path"],
+    },
+  },
+  {
     name: "index_codebase",
     description: "Build (or refresh) the semantic index for the current project so semantic_search works. Walks the project, chunks each text file (~200 lines, 30-line overlap), embeds each chunk via Gemini text-embedding-004, and stores 768-dim vectors in pgvector. Incremental by default (only re-embeds changed chunks via sha-16 of chunk text). Use once per project, then again after significant edits. Skips node_modules/.git/build/binaries/lockfiles. Requires Gemini API key configured in settings (free tier covers thousands of files).",
     parameters: {
@@ -4304,6 +4348,110 @@ async function executeTool(
       return { result: row ? `Deleted finding #${id}` : `No finding #${id} for this project.` };
     }
 
+    case "har_analyze": {
+      const harPath = asStr(args.har_path).trim();
+      if (!harPath) return { result: "Error: har_path required" };
+      const topN = Math.max(1, Math.min(50, Number(args.top_n) || 8));
+      try {
+        const { loadHar, summarizeHar } = await import("../../lib/har");
+        const har = await loadHar(projectDir, harPath);
+        const sum = summarizeHar(har, { topN });
+        const lines: string[] = [];
+        lines.push(`HAR: ${harPath}`);
+        lines.push(`Entries: ${sum.totalEntries}  total time: ${sum.totalDurationMs}ms`);
+        lines.push(`Hosts: ${sum.uniqueHosts.join(", ")}`);
+        lines.push(`Methods: ${Object.entries(sum.methodBreakdown).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+        lines.push(`Statuses: ${Object.entries(sum.statusBreakdown).sort().map(([k, v]) => `${k}=${v}`).join(" ")}`);
+        if (Object.keys(sum.resourceTypes).length) lines.push(`Resource types: ${Object.entries(sum.resourceTypes).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+        lines.push(`Auth detected: bearer=${sum.authDetected.bearerCount} basic=${sum.authDetected.basicCount} cookie=${sum.authDetected.cookieAuthCount} csrf=${sum.authDetected.csrfHeaderCount}`);
+        if (sum.cookies.length) lines.push(`Cookies seen: ${sum.cookies.slice(0, 12).join(", ")}${sum.cookies.length > 12 ? ` (+${sum.cookies.length - 12} more)` : ""}`);
+        if (sum.failures.length) {
+          lines.push(`\nFailures (top ${sum.failures.length}):`);
+          for (const f of sum.failures) {
+            lines.push(`  [${f.idx}] ${f.method} ${f.url}  → ${f.status} ${f.statusText || ""}`);
+            if (f.preview) lines.push(`        ${f.preview.replace(/\s+/g, " ")}`);
+          }
+        }
+        if (sum.slowest.length) {
+          lines.push(`\nSlowest (top ${sum.slowest.length}):`);
+          for (const s of sum.slowest) lines.push(`  [${s.idx}] ${s.ms.toFixed(0)}ms  ${s.method} ${s.url}  (${s.status})`);
+        }
+        if (sum.redirects.length) {
+          lines.push(`\nRedirects:`);
+          for (const r of sum.redirects) lines.push(`  [${r.idx}] ${r.status}  ${r.from} → ${r.to}`);
+        }
+        if (sum.largestResponses.length) {
+          lines.push(`\nLargest responses:`);
+          for (const b of sum.largestResponses) lines.push(`  [${b.idx}] ${(b.bytes / 1024).toFixed(1)}KB  ${b.mimeType || "?"}  ${b.url}`);
+        }
+        return { result: lines.join("\n") };
+      } catch (err: any) {
+        return { result: `Error: ${err.message}` };
+      }
+    }
+
+    case "har_replay": {
+      const harPath = asStr(args.har_path).trim();
+      if (!harPath) return { result: "Error: har_path required" };
+      let indices: number[] | undefined;
+      if (args.indices) {
+        try { const parsed = JSON.parse(asStr(args.indices)); if (Array.isArray(parsed)) indices = parsed.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n)); }
+        catch { return { result: "Error: indices must be valid JSON array of numbers" }; }
+      }
+      let extraHeaders: Record<string, string> | undefined;
+      if (args.extra_headers) {
+        try { const parsed = JSON.parse(asStr(args.extra_headers)); if (parsed && typeof parsed === "object") extraHeaders = parsed; }
+        catch { return { result: "Error: extra_headers must be valid JSON object" }; }
+      }
+      const filter = (asStr(args.filter).toLowerCase() || "all") as "all" | "failed" | "non-2xx";
+      const maxRequests = Math.max(1, Math.min(100, Number(args.max_requests) || 25));
+      const perRequestTimeoutMs = Math.max(1000, Math.min(60_000, Number(args.per_request_timeout_ms) || 15_000));
+      try {
+        const { loadHar, replayHar } = await import("../../lib/har");
+        const har = await loadHar(projectDir, harPath);
+        const results = await replayHar(har, {
+          indices, filter, maxRequests, perRequestTimeoutMs,
+          baseUrlOverride: args.base_url_override ? asStr(args.base_url_override) : undefined,
+          extraHeaders,
+        });
+        const matched = results.filter(r => r.match).length;
+        const lines: string[] = [];
+        lines.push(`HAR replay: ${matched}/${results.length} matched original status`);
+        for (const r of results) {
+          const tag = r.error ? `ERR` : (r.match ? `OK ` : `MIS`);
+          lines.push(`  [${r.idx}] ${tag} ${r.method} ${r.url}`);
+          lines.push(`        original=${r.originalStatus}  replay=${r.replayStatus ?? "-"}  ${r.durationMs}ms${r.error ? `  error=${r.error}` : ""}`);
+          if (r.bodyDiffPreview) lines.push(`        body-diff:\n          ${r.bodyDiffPreview.replace(/\n/g, "\n          ")}`);
+        }
+        return { result: lines.join("\n") };
+      } catch (err: any) {
+        return { result: `Error: ${err.message}` };
+      }
+    }
+
+    case "har_to_playwright": {
+      const harPath = asStr(args.har_path).trim();
+      if (!harPath) return { result: "Error: har_path required" };
+      const includeNavigation = args.include_navigation !== false && args.include_navigation !== "false";
+      const allResourceTypes = args.all_resource_types === true || args.all_resource_types === "true";
+      const maxRequests = Math.max(1, Math.min(200, Number(args.max_requests) || 50));
+      try {
+        const { loadHar, harToPlaywrightSpec, writePlaywrightSpec } = await import("../../lib/har");
+        const har = await loadHar(projectDir, harPath);
+        const spec = harToPlaywrightSpec(har, {
+          includeNavigation,
+          includeXhrFetchOnly: !allResourceTypes,
+          maxRequests,
+          testTitle: `HAR replay: ${pathLib.basename(harPath)}`,
+        });
+        const written = await writePlaywrightSpec(projectDir, spec, asStr(args.name) || "har-replay");
+        const rel = pathLib.relative(projectDir, written);
+        return { result: `Generated Playwright spec → ${rel}\n\nFirst 30 lines:\n${spec.split("\n").slice(0, 30).join("\n")}\n\nRun via: npx playwright test ${rel}` };
+      } catch (err: any) {
+        return { result: `Error: ${err.message}` };
+      }
+    }
+
     case "run_sandboxed": {
       const command = String(args.command || "");
       if (!command) return { result: "Error: command is required" };
@@ -4572,6 +4720,13 @@ For non-website RE work the senior-engineer escalation ladder is:
 
 ### Pre-installed toolchain (DO NOT re-install):
 The following are already on PATH — call them directly via run_command, never install_package: \`radare2\`/\`r2\`, \`strace\`, \`ltrace\`, \`binwalk\`, \`mitmproxy\`/\`mitmdump\`, \`unzip\`, \`7z\`, \`socat\`, \`nmap\`, \`tcpdump\`, \`jq\`, \`wasm2wat\`/\`wasm-objdump\`/\`wat2wasm\` (wabt), plus the always-available \`file\`, \`readelf\`, \`objdump\`, \`nm\`, \`strings\`, \`ldd\`, \`od\`, \`python3\`. Only call install_package for things genuinely missing (uncompyle6, jupyterlab, transformers, etc.).
+
+### HAR file workflow (CRITICAL when user uploads a .har or asks to debug a browser session):
+A HAR file is a JSON capture of every HTTP request a browser made. When a user uploads one or asks "why did this request fail" / "make my code do exactly what the browser did" / "reproduce this":
+1. **har_analyze har_path=...** — ALWAYS first. Get hosts, status breakdown, failures, auth detected, slowest entries.
+2. **har_replay har_path=... [filter=failed] [base_url_override=...] [extra_headers={"Authorization":"Bearer NEW"}]** — replay specific requests from the SERVER. Use filter=failed to focus on 4xx/5xx, or pass indices=[N,M] for specific entries. Use base_url_override to test against staging/prod swap. Use extra_headers when the captured token has expired.
+3. **har_to_playwright har_path=... [name=login-flow]** — emit a runnable Playwright spec under tests/ that reproduces the flow. Then run it via run_command "npx playwright test tests/<file>" or playwright_run.
+After analysis, if you need to fix the user's code to match what the browser did, read the relevant client code with read_file and use edit_file/write_file to align headers, payload shape, auth flow, etc.
 
 ### Semantic codebase search (use BEFORE grep for conceptual questions):
 - **index_codebase [full=true] [path_prefix=...]** — builds or refreshes the pgvector embedding index for this project (Gemini text-embedding-004, 768 dims, 200-line chunks). Incremental by default. Run once per fresh project, plus a quick refresh after large edit waves.
