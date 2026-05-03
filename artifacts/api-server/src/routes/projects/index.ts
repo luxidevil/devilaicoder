@@ -11,6 +11,7 @@ import {
   DeleteProjectParams,
 } from "@workspace/api-zod";
 import { getTemplate } from "../../lib/templates";
+import { logger } from "../../lib/logger";
 import {
   listProcesses,
   tailLogs,
@@ -242,13 +243,14 @@ router.post("/projects/:id/index", async (req, res): Promise<void> => {
   try { await fs.access(dir); } catch { res.status(404).json({ error: "Project directory missing" }); return; }
   const { full, path_prefix } = (req.body ?? {}) as { full?: boolean; path_prefix?: string };
   // Run in background so the request doesn't hold open for minutes on first index.
+  // Use the global logger (req.log's lifetime is tied to the response object).
   (async () => {
     try {
       const { indexProject } = await import("../../lib/embeddings");
       const r = await indexProject(id, dir, { full: !!full, pathPrefix: path_prefix });
-      req.log.info({ projectId: id, ...r }, "background index complete");
+      logger.info({ projectId: id, ...r }, "background index complete");
     } catch (err: any) {
-      req.log.warn({ projectId: id, err: err.message }, "background index failed");
+      logger.warn({ projectId: id, err: err.message }, "background index failed");
     }
   })();
   const { projectEmbeddingStats } = await import("../../lib/embeddings");

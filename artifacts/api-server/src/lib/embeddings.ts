@@ -34,6 +34,12 @@ const MAX_FILE_BYTES = 256 * 1024;
 
 let schemaReadyPromise: Promise<void> | null = null;
 
+// In-memory lock to serialize concurrent full-project indexing per project.
+// Prevents the GC phase from racing — without this, two parallel /index calls
+// can each compute their own `seenPathChunks` set and one may delete chunks
+// the other just inserted.
+const activeIndexes = new Map<number, Promise<IndexResult>>();
+
 export async function ensureEmbeddingSchema(): Promise<void> {
   if (schemaReadyPromise) return schemaReadyPromise;
   schemaReadyPromise = (async () => {
@@ -209,6 +215,24 @@ export interface IndexResult {
 }
 
 export async function indexProject(
+  projectId: number,
+  projectDir: string,
+  opts: { full?: boolean; pathPrefix?: string } = {}
+): Promise<IndexResult> {
+  // Serialize per-project: if an index for this project is already running,
+  // await it and return its result instead of starting a parallel one.
+  const inflight = activeIndexes.get(projectId);
+  if (inflight) {
+    logger.info({ projectId }, "indexProject: joining in-flight run");
+    return inflight;
+  }
+  const run = (async () => doIndexProject(projectId, projectDir, opts))();
+  activeIndexes.set(projectId, run);
+  try { return await run; }
+  finally { activeIndexes.delete(projectId); }
+}
+
+async function doIndexProject(
   projectId: number,
   projectDir: string,
   opts: { full?: boolean; pathPrefix?: string } = {}

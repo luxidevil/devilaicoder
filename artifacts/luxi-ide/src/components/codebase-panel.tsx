@@ -44,6 +44,15 @@ export function CodebasePanel({ projectId, onOpenFile }: Props) {
   const [indexing, setIndexing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const indexPollRef = useRef<{ tick: number | null; stop: number | null }>({ tick: null, stop: null });
+
+  // Clear any in-flight indexing pollers on unmount to avoid leaked timers.
+  useEffect(() => {
+    return () => {
+      if (indexPollRef.current.tick !== null) clearInterval(indexPollRef.current.tick);
+      if (indexPollRef.current.stop !== null) clearTimeout(indexPollRef.current.stop);
+    };
+  }, []);
 
   const refreshStats = useCallback(async () => {
     try {
@@ -113,17 +122,17 @@ export function CodebasePanel({ projectId, onOpenFile }: Props) {
       if (!res.ok && res.status !== 202) {
         setError(data?.error || `HTTP ${res.status}`);
       }
-      // Background job — poll stats for ~60s.
-      const start = Date.now();
-      const tick = setInterval(async () => {
-        await refreshStats();
-        if (Date.now() - start > 60_000) {
-          clearInterval(tick);
-          setIndexing(false);
-        }
-      }, 1500);
-      // Hard stop after 60s regardless
-      setTimeout(() => { clearInterval(tick); setIndexing(false); }, 60_000);
+      // Background job — poll stats for ~60s. Stash refs so unmount cleans up.
+      if (indexPollRef.current.tick !== null) clearInterval(indexPollRef.current.tick);
+      if (indexPollRef.current.stop !== null) clearTimeout(indexPollRef.current.stop);
+      const tick = window.setInterval(() => { refreshStats(); }, 1500);
+      const stop = window.setTimeout(() => {
+        clearInterval(tick);
+        indexPollRef.current.tick = null;
+        indexPollRef.current.stop = null;
+        setIndexing(false);
+      }, 60_000);
+      indexPollRef.current = { tick, stop };
     } catch (err: any) {
       setError(err.message);
       setIndexing(false);
