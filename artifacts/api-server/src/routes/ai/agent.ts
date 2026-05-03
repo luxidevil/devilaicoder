@@ -13,8 +13,8 @@ import {
   getActiveProvider,
   getFallbackProvider,
   agentCallWithRetry,
-  type ToolDeclaration,
   type AgentResponse,
+  type ToolDeclaration,
 } from "../../lib/ai-providers";
 
 const execAsync = promisify(exec);
@@ -1056,6 +1056,86 @@ const toolDeclarations: ToolDeclaration[] = [
     },
   },
   {
+    name: "spawn_subagent",
+    description: "Spin up a focused, read-only research subagent with a restricted tool set. Use to delegate a self-contained investigation: 'find every place we call the auth API and report back', 'audit our error handling', 'trace why X test fails'. The subagent gets its own iteration budget (default 8) and returns a structured text report. It cannot modify files or run state-changing commands. Default allowed tools: think, list_files, read_file, search_files, grep, code_outline, find_definition, find_references, dep_graph, semantic_search, git_diff, git_log, git_blame, parse_file. Prefer this over inlining a deep investigation in the main loop — it preserves your context window.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        goal: { type: "STRING", description: "What you want the subagent to investigate and report on. Be specific — this becomes the subagent's only mission." },
+        scope: { type: "STRING", description: "Optional extra context (file paths, prior findings, hypothesis) to seed the subagent." },
+        max_iterations: { type: "NUMBER", description: "Max tool-call rounds (default 8, max 20)." },
+        extra_tools: { type: "STRING", description: "Optional comma-separated tool names to add to the default read-only set, e.g. 'http_request,web_search,har_analyze'. Write tools (write_file, edit_file, run_command, etc.) are NEVER allowed regardless of what you list here." },
+      },
+      required: ["goal"],
+    },
+  },
+  {
+    name: "architect_review",
+    description: "Run an architect-style code review subagent over recent changes (or specified files). Returns PASS/FAIL plus severity-tagged findings (CRITICAL/HIGH/MODERATE/LOW). Use after completing a feature, fixing a bug, or refactoring — before claiming the work is done. The architect is read-only and uses git_diff + read_file + semantic_search to gather context.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        focus: { type: "STRING", description: "What to focus the review on (e.g. 'security of new HAR replay endpoint', 'race conditions', 'performance', 'API contract correctness'). Defaults to a general code-quality + correctness review." },
+        files: { type: "STRING", description: "Optional comma-separated file paths to review explicitly. If omitted, the architect uses git_diff to find recent changes." },
+        against_ref: { type: "STRING", description: "Git ref to diff against (default 'HEAD~1'). Use 'main' or a commit SHA for larger reviews." },
+        max_iterations: { type: "NUMBER", description: "Max tool-call rounds for the architect (default 10, max 20)." },
+      },
+    },
+  },
+  {
+    name: "task_create",
+    description: "Create a durable project task tracked in the database (visible across sessions, survives restarts). Use to break down a complex user request, capture follow-ups before claiming completion, or hand off work to a future session. Tasks have status (todo/in_progress/done/blocked/cancelled) and priority (P0-P3).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        title: { type: "STRING", description: "Short imperative title, e.g. 'Add SSRF guard to har_replay'." },
+        description: { type: "STRING", description: "Longer description: what, where, acceptance criteria." },
+        priority: { type: "STRING", description: "P0 (critical) / P1 (high, default) / P2 (normal) / P3 (low)." },
+        status: { type: "STRING", description: "Initial status: todo (default) / in_progress / done / blocked / cancelled." },
+        blocked_by: { type: "STRING", description: "Optional JSON array of task IDs this task is blocked by, e.g. '[3, 7]'." },
+        tags: { type: "STRING", description: "Optional comma-separated tags." },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "task_update",
+    description: "Update an existing project task — change status, priority, title, description, blockedBy, or tags. Most common use: mark a task in_progress when starting it, then done when finishing.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        id: { type: "NUMBER", description: "Task ID returned from task_create or task_list." },
+        status: { type: "STRING", description: "New status." },
+        priority: { type: "STRING", description: "New priority." },
+        title: { type: "STRING" },
+        description: { type: "STRING" },
+        blocked_by: { type: "STRING", description: "JSON array of task IDs." },
+        tags: { type: "STRING" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "task_list",
+    description: "List project tasks. Default returns all tasks ordered by status (open first), then priority, then updated time. Use status='todo' to see what's queued, status='in_progress' to see what's active.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        status: { type: "STRING", description: "Optional filter: todo / in_progress / done / blocked / cancelled." },
+        limit: { type: "NUMBER", description: "Max rows (default 100, max 500)." },
+      },
+    },
+  },
+  {
+    name: "task_delete",
+    description: "Delete a project task by id. Prefer task_update with status='cancelled' to keep an audit trail; only delete when the task was created in error.",
+    parameters: {
+      type: "OBJECT",
+      properties: { id: { type: "NUMBER", description: "Task ID." } },
+      required: ["id"],
+    },
+  },
+  {
     name: "har_analyze",
     description: "Parse a HAR (HTTP Archive) file and return a structured summary: total entries, unique hosts, status breakdown, slowest N, failures (4xx/5xx) with body previews, redirects, largest responses, detected auth (Bearer/Basic/Cookie/CSRF), and cookie names. Use FIRST whenever the user uploads/mentions a HAR file or asks to debug what a browser was doing. Path must be inside projectDir or /tmp.",
     parameters: {
@@ -1756,6 +1836,101 @@ function compactToolResult(toolName: string, result: string): string {
   }
 
   return result.slice(0, 15000) + `\n...(truncated from ${result.length} chars)`;
+}
+
+// Default read-only tool set the subagent system trusts. Write/exec tools
+// (write_file, edit_file, run_command, install_package, etc.) are NEVER added
+// to this set, even via extra_tools — see runSubagent below.
+const SUBAGENT_DEFAULT_TOOLS = new Set<string>([
+  "think", "list_files", "read_file", "search_files", "grep", "code_outline",
+  "find_definition", "find_references", "dep_graph", "semantic_search",
+  "git_diff", "git_log", "git_blame", "parse_file", "har_analyze",
+]);
+// Tools the subagent is allowed to opt-into via extra_tools (still read-only or
+// strictly bounded). Everything not in this list is rejected.
+const SUBAGENT_EXTRA_ALLOWED = new Set<string>([
+  "http_request", "web_search", "browse_website", "check_port", "test_api",
+  "read_logs", "process_tree", "network_status", "cve_lookup",
+  "find_and_replace",   // search-only mode is enforced inside the tool already if dry_run is set; we still let architect probe
+  "code_outline", "inspect_archive", "decode_data", "har_analyze", "har_replay",
+  "task_list",
+]);
+
+async function runSubagent(opts: {
+  goal: string;
+  scope?: string;
+  allowedTools?: Set<string>;
+  maxIterations?: number;
+  systemPromptPrefix?: string;
+  projectId: number;
+  projectDir: string;
+}): Promise<{ text: string; toolCallCount: number; iterations: number; truncated: boolean }> {
+  const settings = await getActiveProvider();
+  if (!settings) return { text: "[subagent error: no active AI provider configured]", toolCallCount: 0, iterations: 0, truncated: false };
+  const fallback = await getFallbackProvider();
+  const maxIter = Math.max(1, Math.min(20, opts.maxIterations ?? 8));
+  const allowed = opts.allowedTools ?? SUBAGENT_DEFAULT_TOOLS;
+  const filteredTools = toolDeclarations.filter(t => allowed.has(t.name));
+
+  const subSystem = `${opts.systemPromptPrefix ?? "You are a focused, read-only research subagent of LUXI."} You have one specific goal and a restricted set of tools. Investigate, gather evidence, and return a clear structured report. You are NOT allowed to modify files, run commands, install packages, or change state in any way. When you have enough information to answer, STOP calling tools and write your final report.
+
+GOAL:
+${opts.goal}
+
+${opts.scope ? `CONTEXT / SCOPE:\n${opts.scope}\n\n` : ""}Available tools (${filteredTools.length}): ${filteredTools.map(t => t.name).join(", ")}
+Iteration budget: ${maxIter}
+
+OUTPUT REQUIREMENTS:
+- Use clear sections (## Findings / ## Evidence / ## Recommendation).
+- Cite specific file paths and line numbers when relevant.
+- Be concise but complete. No filler. No hedging.
+- If you cannot answer, say exactly why and what additional access you would need.`;
+
+  let contents: any[] = [{ role: "user", parts: [{ text: opts.goal }] }];
+  let toolCallCount = 0;
+  let finalText = "";
+  let iter = 0;
+  let truncated = false;
+
+  for (iter = 0; iter < maxIter; iter++) {
+    let r: AgentResponse;
+    try {
+      r = await agentCallWithRetry(settings, subSystem, contents, filteredTools, undefined, fallback);
+    } catch (err: any) {
+      finalText += `\n[subagent provider error: ${err.message}]`;
+      break;
+    }
+    if (r.finishReason?.startsWith("error:")) {
+      finalText += `\n[subagent error: ${r.finishReason.slice(6)}]`;
+      break;
+    }
+    if (r.textParts.length > 0) finalText = r.textParts.join("");
+    if (r.toolCalls.length === 0) break;
+
+    const modelParts: any[] = [];
+    for (const tp of r.textParts) modelParts.push({ text: tp });
+    for (const tc of r.toolCalls) modelParts.push({ functionCall: { name: tc.name, args: tc.args } });
+    contents.push({ role: "model", parts: modelParts });
+
+    const responses: any[] = [];
+    for (const tc of r.toolCalls) {
+      toolCallCount++;
+      if (!allowed.has(tc.name)) {
+        responses.push({ functionResponse: { name: tc.name, response: { result: `Error: tool "${tc.name}" is not in this subagent's allow-list. Allowed: ${Array.from(allowed).join(", ")}` } } });
+        continue;
+      }
+      try {
+        const res = await executeTool(tc.name, tc.args, opts.projectId, opts.projectDir);
+        const out = res.result.length > 8000 ? res.result.slice(0, 8000) + "\n[...subagent result truncated]" : res.result;
+        responses.push({ functionResponse: { name: tc.name, response: { result: out } } });
+      } catch (err: any) {
+        responses.push({ functionResponse: { name: tc.name, response: { result: `Error: ${err.message}` } } });
+      }
+    }
+    contents.push({ role: "user", parts: responses });
+  }
+  if (iter >= maxIter) truncated = true;
+  return { text: finalText || "[subagent produced no final text]", toolCallCount, iterations: iter, truncated };
 }
 
 async function executeTool(
@@ -4346,6 +4521,128 @@ async function executeTool(
       const { and, eq } = await import("drizzle-orm");
       const [row] = await db.delete(findingsTable).where(and(eq(findingsTable.id, id), eq(findingsTable.projectId, projectId))).returning();
       return { result: row ? `Deleted finding #${id}` : `No finding #${id} for this project.` };
+    }
+
+    case "spawn_subagent": {
+      const goal = asStr(args.goal).trim();
+      if (!goal) return { result: "Error: goal required" };
+      const scope = args.scope ? asStr(args.scope) : undefined;
+      const maxIter = Math.max(1, Math.min(20, Number(args.max_iterations) || 8));
+      const allowed = new Set(SUBAGENT_DEFAULT_TOOLS);
+      if (args.extra_tools) {
+        for (const raw of asStr(args.extra_tools).split(",")) {
+          const name = raw.trim();
+          if (!name) continue;
+          if (!SUBAGENT_EXTRA_ALLOWED.has(name)) {
+            return { result: `Error: tool "${name}" is not allowed in subagents (state-changing). Allowed extras: ${Array.from(SUBAGENT_EXTRA_ALLOWED).join(", ")}` };
+          }
+          allowed.add(name);
+        }
+      }
+      const r = await runSubagent({ goal, scope, allowedTools: allowed, maxIterations: maxIter, projectId, projectDir });
+      return { result: `## Subagent report (${r.iterations} iter, ${r.toolCallCount} tool calls${r.truncated ? ", TRUNCATED" : ""})\n\n${r.text}` };
+    }
+
+    case "architect_review": {
+      const focus = (args.focus ? asStr(args.focus) : "") || "general code quality, correctness, security, performance, and adherence to existing patterns";
+      const filesArg = args.files ? asStr(args.files).split(",").map(s => s.trim()).filter(Boolean) : [];
+      const againstRef = args.against_ref ? asStr(args.against_ref) : "HEAD~1";
+      const maxIter = Math.max(1, Math.min(20, Number(args.max_iterations) || 10));
+      const scopeParts: string[] = [];
+      scopeParts.push(`Focus: ${focus}`);
+      if (filesArg.length) scopeParts.push(`Files to review explicitly:\n${filesArg.map(f => `- ${f}`).join("\n")}`);
+      else scopeParts.push(`No explicit file list provided. Use git_diff (against_ref="${againstRef}") to discover changed files first, then read each one.`);
+
+      const goal = `Perform an architect-style code review${filesArg.length ? ` of the listed files` : ` of recent changes (diff vs ${againstRef})`}. Identify issues by severity (CRITICAL / HIGH / MODERATE / LOW). For each finding: file:line, the problem, why it matters, and a concrete fix. End with PASS or FAIL verdict. Cosmetic nits OK to omit.`;
+      const systemPromptPrefix = `You are an experienced staff engineer doing a pre-merge code review. You are read-only — you observe and recommend, you do not edit.`;
+      const allowed = new Set(SUBAGENT_DEFAULT_TOOLS); // includes git_diff, read_file, semantic_search, etc.
+
+      const r = await runSubagent({
+        goal,
+        scope: scopeParts.join("\n\n"),
+        allowedTools: allowed,
+        maxIterations: maxIter,
+        systemPromptPrefix,
+        projectId,
+        projectDir,
+      });
+      return { result: `## Architect review (${r.iterations} iter, ${r.toolCallCount} tool calls${r.truncated ? ", TRUNCATED" : ""})\n\n${r.text}` };
+    }
+
+    case "task_create": {
+      const title = asStr(args.title).trim();
+      if (!title) return { result: "Error: title required" };
+      const { createTask } = await import("../../lib/tasks");
+      let blockedBy: number[] = [];
+      if (args.blocked_by) {
+        try { const p = JSON.parse(asStr(args.blocked_by)); if (Array.isArray(p)) blockedBy = p.map((n: any) => Number(n)).filter(Number.isFinite); }
+        catch { return { result: "Error: blocked_by must be JSON array of numbers" }; }
+      }
+      try {
+        const t = await createTask({
+          projectId, title,
+          description: args.description ? asStr(args.description) : undefined,
+          status: args.status ? asStr(args.status) as any : undefined,
+          priority: args.priority ? asStr(args.priority) as any : undefined,
+          blockedBy,
+          tags: args.tags ? asStr(args.tags) : undefined,
+        });
+        return { result: `Created task #${t.id} [${t.priority} ${t.status}] ${t.title}` };
+      } catch (err: any) { return { result: `Error: ${err.message}` }; }
+    }
+
+    case "task_update": {
+      const id = Number(args.id);
+      if (!Number.isFinite(id) || id <= 0) return { result: "Error: id required (number)" };
+      const { updateTask } = await import("../../lib/tasks");
+      let blockedBy: number[] | undefined;
+      if (args.blocked_by !== undefined) {
+        try { const p = JSON.parse(asStr(args.blocked_by)); if (Array.isArray(p)) blockedBy = p.map((n: any) => Number(n)).filter(Number.isFinite); }
+        catch { return { result: "Error: blocked_by must be JSON array of numbers" }; }
+      }
+      try {
+        const t = await updateTask({
+          projectId, taskId: id,
+          title: args.title !== undefined ? asStr(args.title) : undefined,
+          description: args.description !== undefined ? asStr(args.description) : undefined,
+          status: args.status ? asStr(args.status) as any : undefined,
+          priority: args.priority ? asStr(args.priority) as any : undefined,
+          blockedBy,
+          tags: args.tags !== undefined ? asStr(args.tags) : undefined,
+        });
+        if (!t) return { result: `No task #${id} for this project.` };
+        return { result: `Updated task #${t.id} [${t.priority} ${t.status}] ${t.title}` };
+      } catch (err: any) { return { result: `Error: ${err.message}` }; }
+    }
+
+    case "task_list": {
+      const { listTasks, taskStats } = await import("../../lib/tasks");
+      const status = args.status ? asStr(args.status) as any : undefined;
+      const limit = Math.max(1, Math.min(500, Number(args.limit) || 100));
+      try {
+        const tasks = await listTasks(projectId, { status, limit });
+        const stats = await taskStats(projectId);
+        const lines: string[] = [];
+        lines.push(`Tasks: ${stats.total} total | todo=${stats.todo} in_progress=${stats.in_progress} done=${stats.done} blocked=${stats.blocked} cancelled=${stats.cancelled}`);
+        if (status) lines.push(`Filter: status=${status}`);
+        lines.push("");
+        if (tasks.length === 0) lines.push("(no tasks)");
+        for (const t of tasks) {
+          lines.push(`#${t.id}  [${t.priority} ${t.status.padEnd(11)}]  ${t.title}${t.tags ? `  {${t.tags}}` : ""}${t.blockedBy.length ? `  blocked-by:[${t.blockedBy.join(",")}]` : ""}`);
+          if (t.description) lines.push(`     ${t.description.slice(0, 200).replace(/\n/g, " ")}`);
+        }
+        return { result: lines.join("\n") };
+      } catch (err: any) { return { result: `Error: ${err.message}` }; }
+    }
+
+    case "task_delete": {
+      const id = Number(args.id);
+      if (!Number.isFinite(id) || id <= 0) return { result: "Error: id required (number)" };
+      const { deleteTask } = await import("../../lib/tasks");
+      try {
+        const ok = await deleteTask(projectId, id);
+        return { result: ok ? `Deleted task #${id}` : `No task #${id} for this project.` };
+      } catch (err: any) { return { result: `Error: ${err.message}` }; }
     }
 
     case "har_analyze": {

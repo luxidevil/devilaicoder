@@ -10,6 +10,7 @@ import snapshotsRouter from "./snapshots";
 import secretsRouter from "./secrets";
 import githubRouter from "./github";
 import findingsRouter from "./findings";
+import tasksRouter from "./tasks";
 
 const router: IRouter = Router();
 
@@ -24,5 +25,6 @@ router.use(snapshotsRouter);
 router.use(secretsRouter);
 router.use(githubRouter);
 router.use(findingsRouter);
+router.use(tasksRouter);
 
 export default router;
