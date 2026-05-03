@@ -1086,7 +1086,7 @@ const toolDeclarations: ToolDeclaration[] = [
   },
   {
     name: "har_to_playwright",
-    description: "Generate a Playwright .spec.ts file under tests/ that mimics the captured flow: optional page.goto() to the first HTML document + sequential request.fetch()/get/post/etc with status assertions for each XHR/fetch entry. Dominant Authorization/CSRF/User-Agent headers are extracted into a shared extraHeaders map. Use to convert a one-off HAR capture into a permanent regression test or to give the user a runnable repro of a browser session.",
+    description: "Generate a Playwright .spec.ts file under tests/ that mimics the captured flow: optional page.goto() to the first HTML document + sequential request.fetch()/get/post/etc with status assertions for each XHR/fetch entry. Dominant Authorization/CSRF/User-Agent headers are extracted into a shared extraHeaders map. NOTE: request body payloads >4KB are truncated in the generated spec — the agent may need to manually edit the spec to inline larger bodies via fixture files. Use to convert a one-off HAR capture into a permanent regression test or to give the user a runnable repro of a browser session.",
     parameters: {
       type: "OBJECT",
       properties: {
@@ -4407,12 +4407,19 @@ async function executeTool(
       const maxRequests = Math.max(1, Math.min(100, Number(args.max_requests) || 25));
       const perRequestTimeoutMs = Math.max(1000, Math.min(60_000, Number(args.per_request_timeout_ms) || 15_000));
       try {
+        const baseOverride = args.base_url_override ? asStr(args.base_url_override) : undefined;
+        if (baseOverride) {
+          try { await assertPublicUrl(baseOverride); }
+          catch (err: any) { return { result: `Error: base_url_override ${err.message}` }; }
+        }
         const { loadHar, replayHar } = await import("../../lib/har");
         const har = await loadHar(projectDir, harPath);
         const results = await replayHar(har, {
           indices, filter, maxRequests, perRequestTimeoutMs,
-          baseUrlOverride: args.base_url_override ? asStr(args.base_url_override) : undefined,
+          baseUrlOverride: baseOverride,
           extraHeaders,
+          // SSRF guard: refuse to fetch private/loopback/metadata URLs from the captured HAR.
+          urlValidator: async (u) => { await assertPublicUrl(u); },
         });
         const matched = results.filter(r => r.match).length;
         const lines: string[] = [];
@@ -4725,7 +4732,8 @@ The following are already on PATH — call them directly via run_command, never 
 A HAR file is a JSON capture of every HTTP request a browser made. When a user uploads one or asks "why did this request fail" / "make my code do exactly what the browser did" / "reproduce this":
 1. **har_analyze har_path=...** — ALWAYS first. Get hosts, status breakdown, failures, auth detected, slowest entries.
 2. **har_replay har_path=... [filter=failed] [base_url_override=...] [extra_headers={"Authorization":"Bearer NEW"}]** — replay specific requests from the SERVER. Use filter=failed to focus on 4xx/5xx, or pass indices=[N,M] for specific entries. Use base_url_override to test against staging/prod swap. Use extra_headers when the captured token has expired.
-3. **har_to_playwright har_path=... [name=login-flow]** — emit a runnable Playwright spec under tests/ that reproduces the flow. Then run it via run_command "npx playwright test tests/<file>" or playwright_run.
+3. **har_to_playwright har_path=... [name=login-flow]** — emit a runnable Playwright spec under tests/ that reproduces the flow. Then run it via run_command "npx playwright test tests/<file>" or playwright_run. Caveat: request bodies >4KB are truncated in the spec; if the user needs a faithful replay of a large payload, edit the generated spec to read the body from a separate fixture file.
+SSRF note: har_replay refuses to fetch private/loopback/metadata URLs (10.x, 127.x, 169.254.x, etc.) — those entries return error="blocked: ..." in the result.
 After analysis, if you need to fix the user's code to match what the browser did, read the relevant client code with read_file and use edit_file/write_file to align headers, payload shape, auth flow, etc.
 
 ### Semantic codebase search (use BEFORE grep for conceptual questions):

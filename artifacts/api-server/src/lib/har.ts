@@ -46,10 +46,19 @@ const PROJECT_ROOT_GUARD = (projectDir: string, harPath: string): string => {
 
 export async function loadHar(projectDir: string, harPath: string): Promise<Har> {
   const abs = PROJECT_ROOT_GUARD(projectDir, harPath);
-  const stat = await fs.stat(abs);
-  if (!stat.isFile()) throw new Error(`Not a file: ${abs}`);
-  if (stat.size > 200 * 1024 * 1024) throw new Error(`HAR too large (>200MB): ${stat.size} bytes`);
-  const buf = await fs.readFile(abs, "utf8");
+  // Symlink rejection: reject the file itself AND verify realpath stays within bounds.
+  const lst = await fs.lstat(abs);
+  if (lst.isSymbolicLink()) throw new Error(`Refusing symlink HAR path: ${abs}`);
+  if (!lst.isFile()) throw new Error(`Not a file: ${abs}`);
+  if (lst.size > 200 * 1024 * 1024) throw new Error(`HAR too large (>200MB): ${lst.size} bytes`);
+  const real = await fs.realpath(abs);
+  const projAbs = pathLib.resolve(projectDir);
+  const tmpAbs = pathLib.resolve("/tmp");
+  if (!real.startsWith(projAbs + pathLib.sep) && real !== projAbs &&
+      !real.startsWith(tmpAbs + pathLib.sep) && real !== tmpAbs) {
+    throw new Error(`HAR realpath escapes projectDir/tmp: ${real}`);
+  }
+  const buf = await fs.readFile(real, "utf8");
   let parsed: any;
   try { parsed = JSON.parse(buf); } catch (e: any) { throw new Error(`Invalid JSON: ${e.message}`); }
   if (!parsed?.log?.entries || !Array.isArray(parsed.log.entries)) {
@@ -177,10 +186,12 @@ export interface ReplayOptions {
   baseUrlOverride?: string;
   extraHeaders?: Record<string, string>;
   diffBody?: boolean;
+  /** Optional async validator run on every target URL before fetch. Throw to block. */
+  urlValidator?: (url: string) => Promise<void>;
 }
 
 export async function replayHar(har: Har, opts: ReplayOptions = {}): Promise<ReplayResult[]> {
-  const { indices, filter = "all", maxRequests = 25, perRequestTimeoutMs = 15_000, baseUrlOverride, extraHeaders, diffBody = true } = opts;
+  const { indices, filter = "all", maxRequests = 25, perRequestTimeoutMs = 15_000, baseUrlOverride, extraHeaders, diffBody = true, urlValidator } = opts;
   const out: ReplayResult[] = [];
   let candidates: number[] = [];
   if (indices?.length) candidates = indices.filter(i => i >= 0 && i < har.log.entries.length);
@@ -218,6 +229,7 @@ export async function replayHar(har: Har, opts: ReplayOptions = {}): Promise<Rep
     const tHandle = setTimeout(() => ac.abort(), perRequestTimeoutMs);
     const t0 = Date.now();
     try {
+      if (urlValidator) await urlValidator(target);
       const init: RequestInit = { method: e.request.method, headers, signal: ac.signal };
       if (e.request.postData?.text && !["GET", "HEAD"].includes(e.request.method.toUpperCase())) {
         init.body = e.request.postData.text;
@@ -357,9 +369,24 @@ export async function writePlaywrightSpec(projectDir: string, contents: string, 
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const safe = (name || "har-replay").replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 60);
   const fileName = `${safe}-${ts}.spec.ts`;
-  const targetDir = pathLib.join(pathLib.resolve(projectDir), "tests");
+  const projAbs = pathLib.resolve(projectDir);
+  // Reject if project root itself is a symlink.
+  const realRoot = await fs.realpath(projAbs).catch(() => projAbs);
+  if (projAbs !== realRoot) throw new Error("project root itself is a symlink — refusing to operate");
+  const targetDir = pathLib.join(projAbs, "tests");
+  // If tests/ exists, reject if it's a symlink or non-directory.
+  try {
+    const lst = await fs.lstat(targetDir);
+    if (lst.isSymbolicLink()) throw new Error("project's tests/ exists as a symlink — refusing to follow");
+    if (!lst.isDirectory()) throw new Error("project's tests/ exists but is not a directory");
+  } catch (err: any) { if (err?.code !== "ENOENT") throw err; }
   await fs.mkdir(targetDir, { recursive: true });
   const target = pathLib.join(targetDir, fileName);
-  await fs.writeFile(target, contents, "utf8");
+  // If target already exists (race with same-millisecond name), reject if it's a symlink.
+  try { const lst = await fs.lstat(target); if (lst.isSymbolicLink()) throw new Error(`${fileName} is a symlink — refusing to follow`); } catch (err: any) { if (err?.code !== "ENOENT") throw err; }
+  // O_NOFOLLOW guards against TOCTOU symlink-swap between the lstat above and the open below.
+  const fsSync = await import("node:fs");
+  const fh = await fs.open(target, fsSync.constants.O_WRONLY | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | (fsSync.constants.O_NOFOLLOW || 0), 0o644);
+  try { await fh.writeFile(contents); } finally { await fh.close(); }
   return target;
 }
