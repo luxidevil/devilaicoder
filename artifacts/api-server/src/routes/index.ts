@@ -11,6 +11,7 @@ import secretsRouter from "./secrets";
 import githubRouter from "./github";
 import findingsRouter from "./findings";
 import tasksRouter from "./tasks";
+import integrationsRouter from "./integrations";
 
 const router: IRouter = Router();
 
@@ -26,5 +27,6 @@ router.use(secretsRouter);
 router.use(githubRouter);
 router.use(findingsRouter);
 router.use(tasksRouter);
+router.use(integrationsRouter);
 
 export default router;

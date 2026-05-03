@@ -1,6 +1,6 @@
 import { Router, type IRouter } from "express";
 import { db, filesTable, aiRequestsTable, projectsTable, projectSecretsTable } from "@workspace/db";
-import { eq, and } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 import { logger } from "../../lib/logger";
 import { exec, execFile, spawn } from "child_process";
 import { promisify } from "util";
@@ -1056,6 +1056,63 @@ const toolDeclarations: ToolDeclaration[] = [
     },
   },
   {
+    name: "load_skill",
+    description: "Load a tool group ('skill') into your toolbox for the rest of this conversation. Most tools are NOT in your default toolbox — call list_files / search_files / grep / read_file / write_file freely (always available), but for anything more specialized (git, web, browser, har, testing, system, data_inspection, security, notes_memory, code_navigation, file_advanced, integrations, checkpoints, remote_deploy, subagents_review, task_management) you must load the corresponding skill first. Calling load_skill is cheap and additive — load whatever you need. To see all available skills, call load_skill with no name (or name='?').",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        name: { type: "STRING", description: "Skill group name. Pass '?' or omit to list all available skills with descriptions." },
+      },
+    },
+  },
+  {
+    name: "list_integrations",
+    description: "List third-party integrations available for this project (e.g. github, stripe, openai). Returns name + slug + kind + base URL + metadata — never the raw credential. To use one, call integration_fetch with the slug; the server injects auth on your behalf.",
+    parameters: { type: "OBJECT", properties: {} },
+  },
+  {
+    name: "integration_describe",
+    description: "Get the full metadata for one integration by slug. Use to discover the base_url, auth scheme, and any custom metadata fields the user attached. Does NOT return the credential value.",
+    parameters: {
+      type: "OBJECT",
+      properties: { slug: { type: "STRING", description: "Integration slug, e.g. 'github', 'stripe-prod'." } },
+      required: ["slug"],
+    },
+  },
+  {
+    name: "integration_fetch",
+    description: "Make an HTTP request through a stored integration. The server injects the auth header from the integration record — you NEVER see the raw credential. URL can be absolute, or a path that's appended to the integration's base_url. Use this anywhere you'd otherwise call http_request against an authenticated API (Stripe, GitHub, OpenAI, etc).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        slug: { type: "STRING", description: "Integration slug." },
+        method: { type: "STRING", description: "HTTP method (GET/POST/PUT/PATCH/DELETE). Default GET." },
+        path_or_url: { type: "STRING", description: "Either an absolute https URL or a path beginning with '/' that's appended to the integration's base_url." },
+        headers: { type: "STRING", description: "Optional JSON object string of extra headers, e.g. '{\"Content-Type\":\"application/json\"}'." },
+        body: { type: "STRING", description: "Optional request body. For JSON, pass the stringified JSON and set Content-Type in headers." },
+        max_response_bytes: { type: "NUMBER", description: "Max response bytes to return (default 16384, max 65536)." },
+      },
+      required: ["slug", "path_or_url"],
+    },
+  },
+  {
+    name: "list_checkpoints",
+    description: "List the most recent file-system checkpoints (snapshots) for this project, including auto-checkpoints captured after each agent turn that touched files. Returns id, label, reason, fileCount, totalBytes, createdAt.",
+    parameters: {
+      type: "OBJECT",
+      properties: { limit: { type: "NUMBER", description: "Max rows (default 30, max 100)." } },
+    },
+  },
+  {
+    name: "restore_checkpoint",
+    description: "Restore the project's files to a previous checkpoint by id. The current state is auto-snapshotted before the restore so it can itself be rolled back. Use after a destructive change goes wrong, or to undo an experiment.",
+    parameters: {
+      type: "OBJECT",
+      properties: { id: { type: "NUMBER", description: "Snapshot id (from list_checkpoints)." } },
+      required: ["id"],
+    },
+  },
+  {
     name: "spawn_subagent",
     description: "Spin up a focused, read-only research subagent with a restricted tool set. Use to delegate a self-contained investigation: 'find every place we call the auth API and report back', 'audit our error handling', 'trace why X test fails'. The subagent gets its own iteration budget (default 8) and returns a structured text report. It cannot modify files or run state-changing commands. Default allowed tools: think, list_files, read_file, search_files, grep, code_outline, find_definition, find_references, dep_graph, semantic_search, git_diff, git_log, git_blame, parse_file. Prefer this over inlining a deep investigation in the main loop — it preserves your context window.",
     parameters: {
@@ -1838,6 +1895,107 @@ function compactToolResult(toolName: string, result: string): string {
   return result.slice(0, 15000) + `\n...(truncated from ${result.length} chars)`;
 }
 
+// =====================================================================
+// Wave 14 — Lazy skill (tool-group) loading
+// =====================================================================
+// Background: 67 tool defs in every system prompt costs ~25-35K context
+// tokens before the user even speaks. Replit Agent solves this by loading
+// "skills" on demand. We do the same: ALWAYS_ON_TOOLS is the minimal set
+// the agent needs to bootstrap any task; everything else lives in named
+// SKILL_GROUPS that the model loads via the load_skill tool.
+//
+// Loaded skills are tracked per-conversation-loop in a Set passed to the
+// agent loop, then OR'd with ALWAYS_ON when filtering toolDeclarations on
+// each iteration of agentCallWithRetry. Loaded skills can be persisted by
+// the client across turns by sending `loaded_skills: ["..."]` in the
+// /ai/agent request body — the loop seeds the Set from that.
+
+const SKILL_GROUPS: Record<string, { description: string; tools: string[] }> = {
+  code_navigation: {
+    description: "Navigate large codebases: outline files, find definitions/references, build dependency graphs, semantic (embedding) search, rebuild the index.",
+    tools: ["code_outline", "find_definition", "find_references", "dep_graph", "semantic_search", "index_codebase"],
+  },
+  file_advanced: {
+    description: "Heavy file operations beyond write_file: batch writes, surgical edits, find-and-replace across the tree, patch application, file deletion/creation, downloading remote files.",
+    tools: ["batch_write_files", "find_and_replace", "edit_file", "delete_file", "create_file", "apply_patch", "download_file"],
+  },
+  git: {
+    description: "Inspect and operate on git: diff, log, blame, and arbitrary git operations.",
+    tools: ["git_diff", "git_log", "git_blame", "git_operation"],
+  },
+  web: {
+    description: "Reach the public web: fetch URLs (browse), search Google/etc, raw HTTP requests with full headers, HTTP request tracing, full-site clone.",
+    tools: ["browse_website", "web_search", "http_request", "http_trace", "clone_website"],
+  },
+  browser_automation: {
+    description: "Real headless Chromium via Playwright: render JS-heavy SPAs, automate logins, capture HARs and screenshots, scrape post-render DOM.",
+    tools: ["playwright_run"],
+  },
+  har: {
+    description: "Analyze and replay HAR files (DevTools network exports): summarize endpoints, replay requests with diff vs original, codegen Playwright tests from a HAR.",
+    tools: ["har_analyze", "har_replay", "har_to_playwright"],
+  },
+  testing_quality: {
+    description: "Run tests, typechecks, linters, hit local APIs, run code in a sandboxed subprocess.",
+    tools: ["run_tests", "run_typecheck", "run_linter", "test_api", "run_sandboxed"],
+  },
+  system: {
+    description: "Manage the project's processes and environment: install packages, start/stop background processes, check ports, tail logs, inspect process tree, network status, raw shell with multiple commands.",
+    tools: ["install_package", "manage_process", "check_port", "read_logs", "process_tree", "network_status", "shell"],
+  },
+  data_inspection: {
+    description: "Parse and inspect non-text artifacts: structured file parsers (CSV/JSON/HAR/XML/etc), encoding decoders, archive listing, binary/ELF inspection, pcap summary, ad-hoc DB queries.",
+    tools: ["parse_file", "decode_data", "inspect_archive", "inspect_binary", "pcap_summary", "db_query"],
+  },
+  security: {
+    description: "Security helpers: CVE lookup for a package version, automatic stack-trace analysis with fix suggestions.",
+    tools: ["cve_lookup", "analyze_stacktrace"],
+  },
+  notes_memory: {
+    description: "Persistent notes/findings store: add, list, search, delete notes; read/write project_memory key-value bag.",
+    tools: ["note_add", "note_list", "note_search", "note_delete", "project_memory"],
+  },
+  subagents_review: {
+    description: "Spawn focused read-only research subagents and run architect-style code reviews. (spawn_subagent itself is always-on; this group adds architect_review.)",
+    tools: ["architect_review"],
+  },
+  task_management: {
+    description: "Manage durable project tasks (status/priority/dependencies). Use task_list always-on; load this group to delete tasks.",
+    tools: ["task_delete"],
+  },
+  integrations: {
+    description: "Use stored third-party integrations (API keys, OAuth tokens, etc) without seeing the raw credentials: list available integrations, fetch via integration_fetch (server-side injects auth).",
+    tools: ["list_integrations", "integration_fetch", "integration_describe"],
+  },
+  checkpoints: {
+    description: "Project file checkpoints: list snapshots and restore to a previous state. Use after a destructive change goes wrong.",
+    tools: ["list_checkpoints", "restore_checkpoint"],
+  },
+  remote_deploy: {
+    description: "Deploy the project tree to a remote server over SSH/rsync.",
+    tools: ["deploy_ssh"],
+  },
+};
+
+// Tools every agent run gets, no opt-in needed. Keep this list tight.
+const ALWAYS_ON_TOOLS = new Set<string>([
+  "think", "todowrite", "load_skill",
+  "list_files", "read_file", "write_file", "search_files", "grep",
+  "run_command",
+  "spawn_subagent",
+  "task_create", "task_update", "task_list",
+]);
+
+function buildLoadedToolSet(loadedSkills: Set<string>): Set<string> {
+  const out = new Set<string>(ALWAYS_ON_TOOLS);
+  for (const skill of loadedSkills) {
+    const group = SKILL_GROUPS[skill];
+    if (group) for (const t of group.tools) out.add(t);
+  }
+  return out;
+}
+
+// =====================================================================
 // Default read-only tool set the subagent system trusts. Write/exec tools
 // (write_file, edit_file, run_command, install_package, etc.) are NEVER added
 // to this set, even via extra_tools — see runSubagent below.
@@ -1937,7 +2095,8 @@ async function executeTool(
   toolName: string,
   args: Record<string, any>,
   projectId: number,
-  projectDir: string
+  projectDir: string,
+  loadedSkills?: Set<string>
 ): Promise<{ result: string; fileChanged?: { path: string; action: string; before?: string; after?: string }; previewPort?: number; verifiedListening?: boolean }> {
   switch (toolName) {
     case "think": {
@@ -4523,6 +4682,146 @@ async function executeTool(
       return { result: row ? `Deleted finding #${id}` : `No finding #${id} for this project.` };
     }
 
+    case "load_skill": {
+      const requested = args.name ? asStr(args.name).trim() : "";
+      if (!requested || requested === "?" || requested === "list" || requested === "help") {
+        const lines = ["Available skill groups (call load_skill name=<group>):", ""];
+        for (const [name, group] of Object.entries(SKILL_GROUPS)) {
+          lines.push(`  ${name}  (${group.tools.length} tools)`);
+          lines.push(`    ${group.description}`);
+          lines.push(`    tools: ${group.tools.join(", ")}`);
+          lines.push("");
+        }
+        lines.push(`Always-on tools (no load needed): ${Array.from(ALWAYS_ON_TOOLS).join(", ")}`);
+        return { result: lines.join("\n") };
+      }
+      const group = SKILL_GROUPS[requested];
+      if (!group) {
+        return { result: `Unknown skill "${requested}". Available: ${Object.keys(SKILL_GROUPS).join(", ")}. Call load_skill name='?' to see descriptions.` };
+      }
+      if (loadedSkills) loadedSkills.add(requested);
+      const loadedNow = loadedSkills ? Array.from(loadedSkills).join(", ") : requested;
+      return { result: `Loaded skill "${requested}". Now available: ${group.tools.join(", ")}\n\n${group.description}\n\n(All loaded skills this conversation: ${loadedNow})` };
+    }
+
+    case "list_integrations": {
+      const { listIntegrations } = await import("../../lib/integrations");
+      try {
+        const items = await listIntegrations(projectId);
+        if (items.length === 0) return { result: "No integrations configured for this project. The user can add one via the admin panel or POST /api/projects/:projectId/integrations." };
+        const lines: string[] = [`${items.length} integration(s):`];
+        for (const i of items) {
+          lines.push(`  ${i.slug}  (${i.kind})  ${i.name}${i.baseUrl ? `  → ${i.baseUrl}` : ""}`);
+        }
+        return { result: lines.join("\n") };
+      } catch (err: any) { return { result: `Error: ${err.message}` }; }
+    }
+
+    case "integration_describe": {
+      const slug = asStr(args.slug).trim();
+      if (!slug) return { result: "Error: slug required" };
+      const { getIntegrationBySlug } = await import("../../lib/integrations");
+      try {
+        const i = await getIntegrationBySlug(projectId, slug);
+        if (!i) return { result: `No integration with slug "${slug}".` };
+        return { result: JSON.stringify({
+          slug: i.slug, name: i.name, kind: i.kind, baseUrl: i.baseUrl,
+          authHeader: i.authHeader, authPrefix: i.authPrefix === "" ? "(empty)" : i.authPrefix,
+          metadata: i.metadata,
+        }, null, 2) };
+      } catch (err: any) { return { result: `Error: ${err.message}` }; }
+    }
+
+    case "integration_fetch": {
+      const slug = asStr(args.slug).trim();
+      const pathOrUrl = asStr(args.path_or_url).trim();
+      if (!slug || !pathOrUrl) return { result: "Error: slug and path_or_url required" };
+      const method = (args.method ? asStr(args.method) : "GET").toUpperCase();
+      const maxBytes = Math.max(256, Math.min(65536, Number(args.max_response_bytes) || 16384));
+      let extraHeaders: Record<string, string> = {};
+      if (args.headers) {
+        try { const p = JSON.parse(asStr(args.headers)); if (p && typeof p === "object") extraHeaders = p as any; }
+        catch { return { result: "Error: headers must be a JSON object string" }; }
+      }
+      const { getIntegrationBySlug, getDecryptedCredential, buildAuthHeaders } = await import("../../lib/integrations");
+      try {
+        const integ = await getIntegrationBySlug(projectId, slug);
+        if (!integ) return { result: `No integration with slug "${slug}". Use list_integrations to see what's available.` };
+        let url: string;
+        if (/^https?:\/\//i.test(pathOrUrl)) {
+          url = pathOrUrl;
+        } else {
+          if (!integ.baseUrl) return { result: `Integration "${slug}" has no base_url; pass an absolute https URL in path_or_url.` };
+          url = integ.baseUrl.replace(/\/$/, "") + (pathOrUrl.startsWith("/") ? pathOrUrl : "/" + pathOrUrl);
+        }
+        try { await assertPublicUrl(url); }
+        catch (err: any) { return { result: `Error: ${err.message}` }; }
+        const cred = await getDecryptedCredential(projectId, slug);
+        if (!cred) return { result: `Integration "${slug}" has no stored credential.` };
+        const authHeaders = buildAuthHeaders(integ, cred);
+        const finalHeaders: Record<string, string> = { ...authHeaders, ...extraHeaders };
+        const ctrl = new AbortController();
+        const timeout = setTimeout(() => ctrl.abort(), 30000);
+        let resp: Response;
+        try {
+          resp = await fetch(url, {
+            method,
+            headers: finalHeaders,
+            body: ["GET", "HEAD"].includes(method) ? undefined : (args.body ? asStr(args.body) : undefined),
+            redirect: "follow",
+            signal: ctrl.signal,
+          });
+        } finally { clearTimeout(timeout); }
+        const buf = await resp.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        const truncated = bytes.length > maxBytes;
+        const slice = truncated ? bytes.slice(0, maxBytes) : bytes;
+        const text = new TextDecoder("utf-8", { fatal: false }).decode(slice);
+        const headerLines: string[] = [];
+        resp.headers.forEach((v, k) => { if (k.toLowerCase() !== "set-cookie") headerLines.push(`${k}: ${v}`); });
+        return { result: `HTTP ${resp.status} ${resp.statusText} via integration[${slug}] ${method} ${url}\n\nHeaders:\n${headerLines.join("\n")}\n\nBody (${bytes.length} bytes${truncated ? `, truncated to ${maxBytes}` : ""}):\n${text}` };
+      } catch (err: any) {
+        if (err.name === "AbortError") return { result: "Error: integration_fetch timed out after 30s" };
+        return { result: `Error: ${err.message}` };
+      }
+    }
+
+    case "list_checkpoints": {
+      const limit = Math.max(1, Math.min(100, Number(args.limit) || 30));
+      try {
+        const { db, snapshotsTable } = await import("@workspace/db");
+        const rows = await db.select({
+          id: snapshotsTable.id, label: snapshotsTable.label, reason: snapshotsTable.reason,
+          fileCount: snapshotsTable.fileCount, totalBytes: snapshotsTable.totalBytes, createdAt: snapshotsTable.createdAt,
+        }).from(snapshotsTable).where(eq(snapshotsTable.projectId, projectId)).orderBy(desc(snapshotsTable.createdAt)).limit(limit);
+        if (rows.length === 0) return { result: "No checkpoints yet for this project." };
+        const lines: string[] = [`${rows.length} checkpoint(s) (newest first):`];
+        for (const r of rows) {
+          const ts = new Date(r.createdAt as any).toISOString().replace("T", " ").slice(0, 19);
+          lines.push(`  #${r.id}  ${ts}  ${r.fileCount} files / ${(r.totalBytes / 1024).toFixed(1)} KB  — ${r.label}${r.reason ? ` (${String(r.reason).slice(0, 80)})` : ""}`);
+        }
+        return { result: lines.join("\n") };
+      } catch (err: any) { return { result: `Error: ${err.message}` }; }
+    }
+
+    case "restore_checkpoint": {
+      const id = Number(args.id);
+      if (!Number.isFinite(id) || id <= 0) return { result: "Error: id required (number)" };
+      try {
+        // Hit our own REST endpoint so the file-on-disk sync logic stays in one place.
+        const port = process.env.PORT || "8080";
+        const auth = "Basic " + Buffer.from(`${process.env.LUXI_ADMIN_USER || "LUXI"}:${process.env.LUXI_ADMIN_PASS || "LUXI"}`).toString("base64");
+        const resp = await fetch(`http://127.0.0.1:${port}/api/projects/${projectId}/snapshots/${id}/restore`, {
+          method: "POST",
+          headers: { "Authorization": auth, "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const txt = await resp.text();
+        if (!resp.ok) return { result: `Error: restore failed (HTTP ${resp.status}): ${txt.slice(0, 400)}` };
+        return { result: `Restored checkpoint #${id}. Current state was auto-snapshotted before the restore (look for label "Auto-saved before restore #${id}" in list_checkpoints).` };
+      } catch (err: any) { return { result: `Error: ${err.message}` }; }
+    }
+
     case "spawn_subagent": {
       const goal = asStr(args.goal).trim();
       if (!goal) return { result: "Error: goal required" };
@@ -4874,12 +5173,25 @@ async function executeTool(
 }
 
 router.post("/ai/agent", async (req, res): Promise<void> => {
-  const { message, projectId, history, images } = req.body as {
+  const { message, projectId, history, images, loaded_skills: loadedSkillsFromClient } = req.body as {
     message: string;
     projectId: number;
     history?: { role: string; content: string }[];
     images?: { mimeType: string; dataBase64: string }[];
+    loaded_skills?: string[];
   };
+
+  // Wave 14 — lazy skill loading. Seed from client (so reloaded across turns).
+  // load_skill mutates this Set; on each iteration we filter toolDeclarations
+  // to ALWAYS_ON ∪ loadedSkills ∪ alwaysVisibleMeta. Persisted to client via
+  // the loaded_skills_state SSE event (client should echo it on next turn).
+  const loadedSkills = new Set<string>(
+    Array.isArray(loadedSkillsFromClient) ? loadedSkillsFromClient.filter(s => typeof s === "string" && SKILL_GROUPS[s]) : []
+  );
+
+  // Wave 16 — auto-checkpoints. Track files mutated this turn; if any, fire
+  // a snapshot after the loop ends so the user can roll back.
+  const filesChangedThisTurn = new Set<string>();
 
   if (!message || !projectId) {
     res.status(400).json({ error: "message and projectId are required" });
@@ -5195,7 +5507,11 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
       let agentResult: AgentResponse | undefined;
       const callStart = Date.now();
       try {
-        agentResult = await agentCallWithRetry(settings, systemPrompt, contents, toolDeclarations, activeAbort.signal, fallback);
+        // Wave 14 — only ship tool defs the agent has actually loaded. Cuts
+        // ~25-35K tokens of unused tool schemas out of every prompt.
+        const allowedNames = buildLoadedToolSet(loadedSkills);
+        const filteredToolDecls = toolDeclarations.filter(t => allowedNames.has(t.name));
+        agentResult = await agentCallWithRetry(settings, systemPrompt, contents, filteredToolDecls, activeAbort.signal, fallback);
       } catch (err: any) {
         if (err.name === "AbortError" || aborted) break;
         logger.error({ err }, "Agent call error");
@@ -5280,7 +5596,7 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
           }
 
           const results = await Promise.all(
-            agentResult.toolCalls.map(tc => executeTool(tc.name, tc.args, projectId, projectDir))
+            agentResult.toolCalls.map(tc => executeTool(tc.name, tc.args, projectId, projectDir, loadedSkills))
           );
 
           for (let i = 0; i < results.length; i++) {
@@ -5294,6 +5610,7 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
             });
 
             if (fileChanged) {
+              filesChangedThisTurn.add(fileChanged.path);
               sendEvent({ type: "file_changed", ...fileChanged });
               try {
                 const { scheduleFileReindex } = await import("../../lib/embeddings");
@@ -5338,7 +5655,7 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
 
             sendEvent({ type: "tool_call", id: callId, tool: tc.name, args: displayArgs });
 
-            const { result, fileChanged, previewPort, verifiedListening } = await executeTool(tc.name, tc.args, projectId, projectDir);
+            const { result, fileChanged, previewPort, verifiedListening } = await executeTool(tc.name, tc.args, projectId, projectDir, loadedSkills);
             const compacted = compactToolResult(tc.name, result);
 
             sendEvent({
@@ -5347,6 +5664,7 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
             });
 
             if (fileChanged) {
+              filesChangedThisTurn.add(fileChanged.path);
               sendEvent({ type: "file_changed", ...fileChanged });
               try {
                 const { scheduleFileReindex } = await import("../../lib/embeddings");
@@ -5385,6 +5703,43 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
     }
 
     await scanDiskForNewFiles(projectId, projectDir);
+
+    // Wave 16 — fire-and-forget auto-checkpoint if this turn touched files.
+    if (filesChangedThisTurn.size > 0) {
+      (async () => {
+        try {
+          const { db, snapshotsTable, filesTable } = await import("@workspace/db");
+          const files = await db.select().from(filesTable).where(eq(filesTable.projectId, projectId));
+          const snapshotFiles = files.map(f => ({ path: f.path, name: f.name, content: f.content, language: f.language }));
+          const totalBytes = snapshotFiles.reduce((s, f) => s + (f.content?.length ?? 0), 0);
+          const reason = `auto: ${String(message).slice(0, 200)} (${filesChangedThisTurn.size} file${filesChangedThisTurn.size === 1 ? "" : "s"} changed)`;
+          await db.insert(snapshotsTable).values({
+            projectId,
+            label: `Auto ${new Date().toISOString().slice(0, 19).replace("T", " ")}`,
+            reason,
+            files: snapshotFiles,
+            fileCount: snapshotFiles.length,
+            totalBytes,
+          });
+          const allSnaps = await db.select({ id: snapshotsTable.id }).from(snapshotsTable)
+            .where(eq(snapshotsTable.projectId, projectId)).orderBy(desc(snapshotsTable.createdAt));
+          if (allSnaps.length > 50) {
+            for (const { id } of allSnaps.slice(50)) {
+              await db.delete(snapshotsTable).where(eq(snapshotsTable.id, id));
+            }
+          }
+          sendEvent({ type: "checkpoint_created", reason: `auto-checkpoint after ${filesChangedThisTurn.size} file change(s)` });
+        } catch (err: any) {
+          logger.warn({ err: err.message, projectId }, "auto-checkpoint failed");
+        }
+      })();
+    }
+
+    // Wave 14 — echo loaded skill state back to client so it can include it on
+    // the next turn (preserves lazy-loaded toolbox across the conversation).
+    if (loadedSkills.size > 0) {
+      sendEvent({ type: "loaded_skills_state", skills: Array.from(loadedSkills) });
+    }
 
     // End-of-run auto-deploy is gated on deployEligible: it only fires if at
     // least one `check_port` in this run actually proved a port is listening.
