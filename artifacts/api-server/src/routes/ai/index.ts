@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { logger } from "../../lib/logger";
 import {
   getActiveProvider,
+  resolveProviderSelection,
   streamChat,
   invalidateSettingsCache as _invalidate,
 } from "../../lib/ai-providers";
@@ -157,7 +158,7 @@ Return ONLY the new code to replace the selection. No backticks. No explanation.
 });
 
 router.post("/ai/chat", async (req, res): Promise<void> => {
-  const { message, projectId, history, fileContext, fileName, allFiles, mode } = req.body as {
+  const { message, projectId, history, fileContext, fileName, allFiles, mode, providerOverride, modelOverride } = req.body as {
     message: string;
     projectId?: number;
     history?: { role: "user" | "assistant"; content: string }[];
@@ -165,6 +166,8 @@ router.post("/ai/chat", async (req, res): Promise<void> => {
     fileName?: string;
     allFiles?: { name: string; path: string; content: string }[];
     mode?: "message" | "plan" | "action";
+    providerOverride?: string;
+    modelOverride?: string;
   };
 
   if (!message) {
@@ -172,9 +175,9 @@ router.post("/ai/chat", async (req, res): Promise<void> => {
     return;
   }
 
-  const settings = await getActiveProvider();
+  const settings = await resolveProviderSelection(providerOverride, modelOverride);
   if (!settings) {
-    res.status(503).json({ error: "AI not configured. Please add your API key in the admin panel." });
+    res.status(503).json({ error: "Selected AI provider is not configured or is unavailable. Please change provider or add the required key in the admin panel." });
     return;
   }
 

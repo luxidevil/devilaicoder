@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   FilePlus,
   Trash2,
@@ -125,6 +126,20 @@ type AgentEvent =
   | { type: "file_changed"; path: string; action: string; before?: string; after?: string }
   | { type: "preview_port"; port: number }
   | { type: "preview_url"; url: string }
+  | {
+      type: "browser_session";
+      tool: "playwright_run";
+      status: "ok" | "failed";
+      finalUrl?: string;
+      htmlPath?: string | null;
+      harPath?: string | null;
+      pdfPath?: string | null;
+      screenshots?: string[];
+      screenshotDataUrl?: string | null;
+      actionLog?: string[];
+      evalResults?: { index: number; expression: string; result: string }[];
+      error?: string | null;
+    }
   | { type: "message"; content: string }
   | { type: "error"; content: string }
   | { type: "done" };
@@ -143,6 +158,7 @@ function getToolIcon(tool: string) {
     case "run_command": return <Terminal className="w-3 h-3" />;
     case "install_package": return <Play className="w-3 h-3" />;
     case "browse_website": return <Globe className="w-3 h-3" />;
+    case "playwright_run": return <Eye className="w-3 h-3" />;
     case "web_search": return <Search className="w-3 h-3" />;
     case "git_operation": return <Zap className="w-3 h-3" />;
     case "download_file": return <File className="w-3 h-3" />;
@@ -175,6 +191,7 @@ function getToolLabel(tool: string) {
     case "run_command": return "Running command";
     case "install_package": return "Installing packages";
     case "browse_website": return "Browsing website";
+    case "playwright_run": return "Running Playwright";
     case "web_search": return "Searching the web";
     case "git_operation": return "Git operation";
     case "download_file": return "Downloading file";
@@ -260,11 +277,103 @@ function TodoChecklist({ raw }: { raw: string }) {
 // We deliberately keep the markers tight (the agent server uses these literal
 // prefixes for run_command / install_package / shell failures) so we don't show
 // "Fix with AI" on harmless results that happen to contain the word "error".
-const FAILURE_TOOLS = new Set(["run_command", "install_package", "shell", "manage_process"]);
-const FAILURE_RE = /^(Exit \S+:|Error:|Command timed out)/;
+const FAILURE_TOOLS = new Set(["run_command", "install_package", "shell", "manage_process", "playwright_run"]);
+const FAILURE_RE = /^(Exit \S+:|Error:|Command timed out|playwright_run failed:)/i;
 function detectFailure(tool: string, result?: string): boolean {
   if (!result || !FAILURE_TOOLS.has(tool)) return false;
   return FAILURE_RE.test(result.trimStart());
+}
+
+function BrowserSessionCard({ event }: { event: Extract<AgentEvent, { type: "browser_session" }> }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 4 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={cn(
+        "rounded-lg border p-3 space-y-3",
+        event.status === "failed"
+          ? "bg-red-500/5 border-red-500/20"
+          : "bg-sky-500/5 border-sky-500/20"
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <div className={cn(
+          "w-5 h-5 rounded-full flex items-center justify-center",
+          event.status === "failed" ? "bg-red-500/20" : "bg-sky-500/20"
+        )}>
+          <Eye className={cn("w-3 h-3", event.status === "failed" ? "text-red-300" : "text-sky-300")} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-xs font-medium text-foreground">Playwright browser view</div>
+          <div className="text-[11px] text-muted-foreground truncate">
+            {event.finalUrl || "Browser session snapshot"}
+          </div>
+        </div>
+        <div className={cn(
+          "text-[10px] px-2 py-0.5 rounded-full border",
+          event.status === "failed"
+            ? "border-red-500/30 text-red-300 bg-red-500/10"
+            : "border-emerald-500/30 text-emerald-300 bg-emerald-500/10"
+        )}>
+          {event.status === "failed" ? "failed" : "ready"}
+        </div>
+      </div>
+
+      {event.screenshotDataUrl && (
+        <div className="rounded-md overflow-hidden border border-border/60 bg-black">
+          <img
+            src={event.screenshotDataUrl}
+            alt="Playwright browser snapshot"
+            className="w-full max-h-80 object-contain bg-black"
+          />
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
+        {event.htmlPath && (
+          <div className="rounded-md bg-background/60 border border-border/50 px-2 py-1">
+            <span className="text-muted-foreground">HTML:</span>{" "}
+            <span className="font-mono text-foreground">{event.htmlPath}</span>
+          </div>
+        )}
+        {event.harPath && (
+          <div className="rounded-md bg-background/60 border border-border/50 px-2 py-1">
+            <span className="text-muted-foreground">HAR:</span>{" "}
+            <span className="font-mono text-foreground">{event.harPath}</span>
+          </div>
+        )}
+        {event.pdfPath && (
+          <div className="rounded-md bg-background/60 border border-border/50 px-2 py-1">
+            <span className="text-muted-foreground">PDF:</span>{" "}
+            <span className="font-mono text-foreground">{event.pdfPath}</span>
+          </div>
+        )}
+        {event.screenshots && event.screenshots.length > 0 && (
+          <div className="rounded-md bg-background/60 border border-border/50 px-2 py-1">
+            <span className="text-muted-foreground">Shots:</span>{" "}
+            <span className="font-mono text-foreground">{event.screenshots.length}</span>
+          </div>
+        )}
+      </div>
+
+      {event.error && (
+        <div className="rounded-md border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[11px] text-red-200">
+          {event.error}
+        </div>
+      )}
+
+      {Array.isArray(event.actionLog) && event.actionLog.length > 0 && (
+        <details className="rounded-md border border-border/50 bg-background/50">
+          <summary className="cursor-pointer list-none px-3 py-2 text-[11px] font-medium text-foreground">
+            Browser action log
+          </summary>
+          <pre className="px-3 pb-3 text-[11px] font-mono text-muted-foreground whitespace-pre-wrap max-h-56 overflow-y-auto">
+            {event.actionLog.join("\n")}
+          </pre>
+        </details>
+      )}
+    </motion.div>
+  );
 }
 
 function ToolCallCard({ tool, args, result, isExpanded, onToggle, onFix }: {
@@ -423,6 +532,48 @@ function MarkdownContent({ content }: { content: string }) {
 }
 
 type ChatMode = "agent" | "chat";
+type UserProviderChoice = "auto" | "opus" | "vertex";
+
+type AttachedFile = {
+  name: string;
+  content: string;
+  size: number;
+};
+
+const DEFAULT_TEXT_ATTACHMENT_LIMIT = 10 * 1024 * 1024;
+const HAR_ATTACHMENT_LIMIT = 50 * 1024 * 1024;
+
+function getAttachmentLimit(fileName: string): number {
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+  return ext === "har" ? HAR_ATTACHMENT_LIMIT : DEFAULT_TEXT_ATTACHMENT_LIMIT;
+}
+
+function formatAttachmentLimit(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return `${Number.isInteger(mb) ? mb : mb.toFixed(1)}MB`;
+}
+
+function sanitizeAttachmentName(fileName: string): string {
+  const safe = fileName.replace(/[^A-Za-z0-9._-]+/g, "_");
+  return safe.slice(0, 120) || "attachment.txt";
+}
+
+const USER_PROVIDER_OPTIONS: Record<UserProviderChoice, { label: string; providerOverride?: string; modelOverride?: string }> = {
+  auto: { label: "Auto" },
+  opus: { label: "Opus", providerOverride: "anthropic", modelOverride: "claude-opus-4-20250514" },
+  vertex: { label: "Vertex", providerOverride: "vertex", modelOverride: "gemini-2.5-pro" },
+};
+
+function shouldOfferVertexFallback(errorText: string): boolean {
+  const t = errorText.toLowerCase();
+  return (
+    t.includes("523") ||
+    t.includes("origin is unreachable") ||
+    t.includes("cloudflare") ||
+    t.includes("anthropic api error") ||
+    t.includes("selected ai provider is not configured or is unavailable")
+  );
+}
 
 export default function IDE() {
   const params = useParams<{ id: string }>();
@@ -489,7 +640,7 @@ export default function IDE() {
   const [agentEvents, setAgentEvents] = useState<AgentEvent[]>([]);
   const [agentInput, setAgentInput] = useState("");
   const [isAgentRunning, setIsAgentRunning] = useState(false);
-  const [attachedFiles, setAttachedFiles] = useState<{ name: string; content: string }[]>([]);
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [attachedImages, setAttachedImages] = useState<{ name: string; mimeType: string; dataBase64: string; previewUrl: string }[]>([]);
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -653,6 +804,18 @@ export default function IDE() {
   const [previewKey, setPreviewKey] = useState(0);
 
   const [chatMode, setChatMode] = useState<ChatMode>("agent");
+  const [userProviderChoice, setUserProviderChoice] = useState<UserProviderChoice>(() => {
+    if (typeof window === "undefined") return "auto";
+    const saved = window.localStorage.getItem("luxi_user_provider_choice");
+    return saved === "opus" || saved === "vertex" || saved === "auto" ? saved : "auto";
+  });
+  const providerFallbackPromptedRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("luxi_user_provider_choice", userProviderChoice);
+    }
+  }, [userProviderChoice]);
   const [showSSHSettings, setShowSSHSettings] = useState(false);
   const [sshForm, setSSHForm] = useState({
     sshHost: "", sshUser: "root", sshPort: "22",
@@ -966,10 +1129,10 @@ export default function IDE() {
 
   const handleFileAttach = useCallback((fileList: FileList | null) => {
     if (!fileList) return;
-    const maxSize = 5 * 1024 * 1024;
     Array.from(fileList).forEach((file) => {
+      const maxSize = getAttachmentLimit(file.name);
       if (file.size > maxSize) {
-        setAgentEvents((prev) => [...prev, { type: "error", content: `File "${file.name}" too large (max 5MB)` }]);
+        setAgentEvents((prev) => [...prev, { type: "error", content: `File "${file.name}" too large (max ${formatAttachmentLimit(maxSize)})` }]);
         return;
       }
       // Route image MIME types to the image attachments store
@@ -990,7 +1153,7 @@ export default function IDE() {
       const reader = new FileReader();
       reader.onload = () => {
         const content = reader.result as string;
-        setAttachedFiles((prev) => [...prev, { name: file.name, content }]);
+        setAttachedFiles((prev) => [...prev, { name: file.name, content, size: file.size }]);
       };
       reader.readAsText(file);
     });
@@ -1038,15 +1201,40 @@ export default function IDE() {
 
     let userMessage = agentInput.trim();
 
+    const uploadAttachmentToProject = async (file: AttachedFile, index: number) => {
+      const stamp = `${Date.now()}-${index}`;
+      const projectPath = `.luxi/attachments/${stamp}-${sanitizeAttachmentName(file.name)}`;
+      const response = await fetch(`/api/projects/${projectId}/files`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: projectPath, content: file.content }),
+      });
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: "Failed to save attachment" }));
+        throw new Error(err.error ?? `Failed to save attachment "${file.name}"`);
+      }
+      return projectPath;
+    };
+
     if (attachedFiles.length > 0) {
-      const filesContext = attachedFiles.map((f) => {
-        const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
-        const isHar = ext === "har";
-        const prefix = isHar
-          ? `[ATTACHED HAR FILE: ${f.name}] — Parse this with parse_file tool to extract all HTTP requests and recreate the application.\n`
-          : `[ATTACHED FILE: ${f.name}]\n`;
-        return `${prefix}Content:\n\`\`\`\n${f.content.slice(0, 50000)}\n\`\`\``;
-      }).join("\n\n");
+      let filesContext = "";
+      try {
+        const saved = await Promise.all(attachedFiles.map((f, i) => uploadAttachmentToProject(f, i)));
+        filesContext = attachedFiles.map((f, i) => {
+          const savedPath = saved[i];
+          const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
+          const isHar = ext === "har";
+          if (isHar) {
+            return `[ATTACHED HAR FILE: ${f.name}] saved at \`${savedPath}\` — Use parse_file/har_analyze/har_replay on this path to inspect the real browser traffic and reproduce the flow.`;
+          }
+          const inlinePreview = f.content.slice(0, 50000);
+          return `[ATTACHED FILE: ${f.name}] saved at \`${savedPath}\`\nContent preview:\n\`\`\`\n${inlinePreview}\n\`\`\``;
+        }).join("\n\n");
+      } catch (err: any) {
+        setAgentEvents((prev) => [...prev, { type: "error", content: err.message ?? "Failed to save attached files" }]);
+        setIsAgentRunning(false);
+        return;
+      }
       userMessage = `${userMessage}\n\n---\nATTACHED FILES:\n${filesContext}`;
     }
     const sentImages = attachedImages.map((img) => ({
@@ -1057,6 +1245,7 @@ export default function IDE() {
       mimeType: img.mimeType,
       dataBase64: img.previewUrl,
     }));
+    const providerPreset = USER_PROVIDER_OPTIONS[userProviderChoice];
 
     setAttachedFiles([]);
     setAttachedImages([]);
@@ -1099,6 +1288,8 @@ export default function IDE() {
             projectId,
             history: history.slice(-20),
             mode: "message",
+            providerOverride: providerPreset.providerOverride,
+            modelOverride: providerPreset.modelOverride,
           }),
           signal: controller.signal,
         });
@@ -1135,6 +1326,18 @@ export default function IDE() {
                 }
                 if (event.error) {
                   setAgentEvents((prev) => [...prev, { type: "error", content: event.error }]);
+                  if (
+                    userProviderChoice === "opus" &&
+                    !providerFallbackPromptedRef.current &&
+                    shouldOfferVertexFallback(event.error)
+                  ) {
+                    providerFallbackPromptedRef.current = true;
+                    const shouldSwitch = window.confirm("Opus is unavailable right now. Switch this IDE session to Vertex so you can keep working?");
+                    if (shouldSwitch) {
+                      setUserProviderChoice("vertex");
+                      toast.success("Switched AI provider to Vertex for this session.");
+                    }
+                  }
                 }
               } catch {}
             }
@@ -1166,6 +1369,8 @@ export default function IDE() {
           projectId,
           history: history.slice(-20),
           images: sentImages,
+          providerOverride: providerPreset.providerOverride,
+          modelOverride: providerPreset.modelOverride,
         }),
         signal: controller.signal,
       });
@@ -1199,6 +1404,20 @@ export default function IDE() {
               if (event.type === "done") continue;
 
               setAgentEvents((prev) => [...prev, event]);
+
+              if (
+                event.type === "error" &&
+                userProviderChoice === "opus" &&
+                !providerFallbackPromptedRef.current &&
+                shouldOfferVertexFallback(event.content)
+              ) {
+                providerFallbackPromptedRef.current = true;
+                const shouldSwitch = window.confirm("Opus is unavailable right now. Switch this IDE session to Vertex so you can keep working?");
+                if (shouldSwitch) {
+                  setUserProviderChoice("vertex");
+                  toast.success("Switched AI provider to Vertex for this session.");
+                }
+              }
 
               if (convId) {
                 pendingSaves.push(saveEventToDb(convId, event));
@@ -1897,6 +2116,16 @@ export default function IDE() {
               </button>
             </div>
             <div className="flex items-center gap-1">
+              <Select value={userProviderChoice} onValueChange={(v) => setUserProviderChoice(v as UserProviderChoice)}>
+                <SelectTrigger className="h-7 w-[110px] text-[11px]" data-testid="select-user-provider">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">Auto</SelectItem>
+                  <SelectItem value="opus">Opus</SelectItem>
+                  <SelectItem value="vertex">Vertex</SelectItem>
+                </SelectContent>
+              </Select>
               {isAgentRunning && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -2121,6 +2350,9 @@ export default function IDE() {
                         </motion.div>
                       );
 
+                    case "browser_session":
+                      return <BrowserSessionCard key={i} event={event} />;
+
                     case "message":
                       return (
                         <div key={i} className="flex gap-2 items-start">
@@ -2179,7 +2411,7 @@ export default function IDE() {
                   <div key={i} className="flex items-center gap-1 px-2 py-0.5 bg-primary/10 border border-primary/20 rounded text-[10px] font-mono text-primary">
                     <Paperclip className="w-2.5 h-2.5" />
                     <span className="max-w-[120px] truncate">{f.name}</span>
-                    <span className="text-[9px] opacity-60">({Math.round(f.content.length / 1024)}KB)</span>
+                    <span className="text-[9px] opacity-60">({Math.max(1, Math.round(f.size / 1024))}KB)</span>
                     <button
                       onClick={() => setAttachedFiles((prev) => prev.filter((_, j) => j !== i))}
                       className="ml-0.5 hover:text-destructive"
@@ -2294,6 +2526,7 @@ export default function IDE() {
             </div>
             <p className="text-[10px] text-muted-foreground mt-1.5">
               {chatMode === "agent" ? `${fileCount} files in project` : "Chat mode — no code changes"}
+              <span className="ml-1.5">/ provider: {USER_PROVIDER_OPTIONS[userProviderChoice].label}</span>
               {isAgentRunning && <span className="text-primary ml-1.5 animate-pulse">/ {chatMode === "agent" ? "agent running" : "thinking"}</span>}
             </p>
           </div>

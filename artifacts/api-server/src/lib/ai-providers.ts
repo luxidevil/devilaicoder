@@ -196,10 +196,12 @@ export const PROVIDER_CONFIGS: Record<ProviderName, ProviderConfig> = {
   anthropic: {
     label: "Anthropic Claude",
     apiStyle: "anthropic",
+    defaultBaseURL: "https://api.anthropic.com",
+    baseURLEditable: true,
     needsKey: true,
     defaultModel: "claude-sonnet-4-20250514",
     signupURL: "https://console.anthropic.com",
-    description: "Best-in-class for coding tasks. Claude Sonnet 4 + Opus 4.",
+    description: "Best-in-class for coding tasks. Claude Sonnet 4 + Opus 4. Also works with Anthropic-compatible gateways.",
     models: [
       { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4 (Best balance)", vision: true, recommended: true },
       { value: "claude-opus-4-20250514", label: "Claude Opus 4 (Most capable)", vision: true },
@@ -684,6 +686,48 @@ const ENV_KEY_MAP: Record<ProviderName, string> = {
   custom: "CUSTOM_API_KEY",
 };
 
+const ENV_ALT_KEY_MAP: Partial<Record<ProviderName, string[]>> = {
+  anthropic: ["ANTHROPIC_AUTH_TOKEN"],
+};
+
+const ENV_BASE_URL_MAP: Partial<Record<ProviderName, string>> = {
+  vertex: "VERTEX_BASE_URL",
+  anthropic: "ANTHROPIC_BASE_URL",
+  custom: "CUSTOM_BASE_URL",
+};
+
+function getFirstEnvValue(keys: readonly string[]): string {
+  for (const key of keys) {
+    const value = process.env[key]?.trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+export function getEnvProviderApiKey(provider: ProviderName): string {
+  return getFirstEnvValue([ENV_KEY_MAP[provider], ...(ENV_ALT_KEY_MAP[provider] ?? [])]);
+}
+
+export function getEnvProviderBaseURL(provider: ProviderName): string {
+  const key = ENV_BASE_URL_MAP[provider];
+  return key ? (process.env[key]?.trim().replace(/\/+$/, "") || "") : "";
+}
+
+export function getEnvProviderModel(provider: ProviderName): string {
+  const providerModelKey = `${provider.toUpperCase()}_MODEL`;
+  return getFirstEnvValue([providerModelKey]);
+}
+
+export function getEnvActiveModel(provider: ProviderName): string {
+  return getFirstEnvValue(["AI_MODEL", "LUXI_AI_MODEL", `${provider.toUpperCase()}_MODEL`]);
+}
+
+export function getEnvDefaultProvider(): ProviderName | null {
+  const raw = getFirstEnvValue(["AI_PROVIDER", "LUXI_AI_PROVIDER"]).toLowerCase();
+  if (!raw) return null;
+  return raw in PROVIDER_CONFIGS ? (raw as ProviderName) : null;
+}
+
 function settingKeyForApiKey(p: ProviderName): string {
   return `${p}_api_key`;
 }
@@ -697,31 +741,31 @@ export async function getProviderSettingsByName(name: ProviderName): Promise<Pro
   const cfg = PROVIDER_CONFIGS[name];
   if (!cfg) return null;
 
-  const apiKey = s[settingKeyForApiKey(name)] || process.env[ENV_KEY_MAP[name]] || "";
+  const apiKey = s[settingKeyForApiKey(name)] || getEnvProviderApiKey(name) || "";
   if (cfg.needsKey && !apiKey) return null;
 
-  const model = s[`${name}_model`] || cfg.defaultModel;
+  const model = s[`${name}_model`] || getEnvProviderModel(name) || cfg.defaultModel;
   if (!model) return null;
 
-  const baseURL = s[settingKeyForBaseURL(name)] || cfg.defaultBaseURL;
+  const baseURL = s[settingKeyForBaseURL(name)] || getEnvProviderBaseURL(name) || cfg.defaultBaseURL;
 
   return { provider: name, apiKey, model, baseURL };
 }
 
 export async function getActiveProvider(): Promise<ProviderSettings | null> {
   const s = await loadAllSettings();
-  const provider = (s["ai_provider"] as ProviderName) ?? "gemini";
+  const provider = ((s["ai_provider"] as ProviderName | undefined) || getEnvDefaultProvider() || "gemini") as ProviderName;
 
   const cfg = PROVIDER_CONFIGS[provider];
   if (!cfg) return null;
 
-  const apiKey = s[settingKeyForApiKey(provider)] || process.env[ENV_KEY_MAP[provider]] || "";
+  const apiKey = s[settingKeyForApiKey(provider)] || getEnvProviderApiKey(provider) || "";
   if (cfg.needsKey && !apiKey) return null;
 
-  const model = s["ai_model"] || s[`${provider}_model`] || cfg.defaultModel;
+  const model = s["ai_model"] || s[`${provider}_model`] || getEnvActiveModel(provider) || cfg.defaultModel;
   if (!model) return null;
 
-  const baseURL = s[settingKeyForBaseURL(provider)] || cfg.defaultBaseURL;
+  const baseURL = s[settingKeyForBaseURL(provider)] || getEnvProviderBaseURL(provider) || cfg.defaultBaseURL;
 
   return { provider, apiKey, model, baseURL };
 }
@@ -731,6 +775,24 @@ export async function getFallbackProvider(): Promise<ProviderSettings | null> {
   const fb = s["ai_fallback_provider"] as ProviderName | undefined;
   if (!fb || !PROVIDER_CONFIGS[fb]) return null;
   return getProviderSettingsByName(fb);
+}
+
+export async function resolveProviderSelection(
+  providerOverride?: string | null,
+  modelOverride?: string | null
+): Promise<ProviderSettings | null> {
+  const requestedProvider = (providerOverride || "").trim();
+  const requestedModel = (modelOverride || "").trim();
+
+  const base = requestedProvider
+    ? (requestedProvider in PROVIDER_CONFIGS
+        ? await getProviderSettingsByName(requestedProvider as ProviderName)
+        : null)
+    : await getActiveProvider();
+
+  if (!base) return null;
+  if (!requestedModel) return base;
+  return { ...base, model: requestedModel };
 }
 
 // ============================================================================
@@ -913,6 +975,7 @@ async function streamAnthropicChat(
   messages: ChatMessage[],
   signal?: AbortSignal
 ): Promise<ReadableStream<StreamChunk>> {
+  const baseURL = (settings.baseURL || PROVIDER_CONFIGS[settings.provider].defaultBaseURL || "https://api.anthropic.com").replace(/\/+$/, "");
   const anthropicMessages = messages.map((m) => {
     const role = m.role === "user" ? ("user" as const) : ("assistant" as const);
     if (m.images?.length) {
@@ -931,7 +994,7 @@ async function streamAnthropicChat(
     return { role, content: m.content };
   });
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch(`${baseURL}/v1/messages`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -948,9 +1011,32 @@ async function streamAnthropicChat(
     }),
   });
 
+  const contentType = response.headers.get("content-type") || "";
+
   if (!response.ok) {
     const errText = await response.text();
     return makeErrorStream(`Anthropic API error ${response.status}: ${errText.slice(0, 300)}`);
+  }
+
+  if (contentType.includes("application/json")) {
+    const data: any = await response.json().catch(() => null);
+    if (data?.type === "error" || data?.error?.message) {
+      const message = data?.error?.message || "Unknown Anthropic-compatible error";
+      return makeErrorStream(`Anthropic API error: ${message}`);
+    }
+    if (Array.isArray(data?.content)) {
+      const text = data.content
+        .filter((block: any) => block?.type === "text" && typeof block?.text === "string")
+        .map((block: any) => block.text)
+        .join("");
+      return new ReadableStream<StreamChunk>({
+        start(controller) {
+          if (text) controller.enqueue({ text });
+          controller.enqueue({ done: true });
+          controller.close();
+        },
+      });
+    }
   }
 
   return parseSSEStream(response, (data) => {
@@ -1252,11 +1338,12 @@ async function agentCallAnthropic(
   tools: ToolDeclaration[],
   signal?: AbortSignal
 ): Promise<AgentResponse> {
+  const baseURL = (settings.baseURL || PROVIDER_CONFIGS[settings.provider].defaultBaseURL || "https://api.anthropic.com").replace(/\/+$/, "");
   const messages = convertContentsToAnthropic(contents);
 
   let response: Response;
   try {
-    response = await fetch("https://api.anthropic.com/v1/messages", {
+    response = await fetch(`${baseURL}/v1/messages`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1282,6 +1369,10 @@ async function agentCallAnthropic(
   }
 
   const data = (await response.json()) as any;
+  if (data?.type === "error" || data?.error?.message) {
+    const message = (data?.error?.message || "Unknown Anthropic-compatible error").slice(0, 200);
+    return { textParts: [], toolCalls: [], finishReason: `error:provider:${message}` };
+  }
   const textParts: string[] = [];
   const toolCalls: { name: string; args: Record<string, any> }[] = [];
 

@@ -12,6 +12,7 @@ import { chromium, type Browser, type BrowserContext, type Page } from "playwrig
 import {
   getActiveProvider,
   getFallbackProvider,
+  resolveProviderSelection,
   agentCallWithRetry,
   type AgentResponse,
   type ToolDeclaration,
@@ -1103,7 +1104,7 @@ const toolDeclarations: ToolDeclaration[] = [
   },
   {
     name: "spawn_subagent",
-    description: "Spin up a focused, read-only research subagent with a restricted tool set. Use to delegate a self-contained investigation: 'find every place we call the auth API and report back', 'audit our error handling', 'trace why X test fails'. The subagent gets its own iteration budget (default 8) and returns a structured text report. It cannot modify files or run state-changing commands. Default allowed tools: think, list_files, read_file, search_files, grep, code_outline, find_definition, find_references, dep_graph, semantic_search, git_diff, git_log, git_blame, parse_file. Prefer this over inlining a deep investigation in the main loop — it preserves your context window.",
+    description: "Spin up a focused, read-only research subagent with a restricted tool set. Use to delegate a self-contained investigation: 'find every place we call the auth API and report back', 'audit our error handling', 'trace why X test fails'. The subagent gets its own iteration budget (default 8) and returns a structured text report. It cannot modify files or run state-changing commands. Default allowed tools: think, list_files, read_file, search_files, grep, code_outline, find_definition, find_references, dep_graph, semantic_search, git_diff, git_log, git_blame, parse_file. Prefer this over inlining a deep investigation in the main loop — it preserves your context window. NEVER use this for browser automation, Playwright, package installs, or anything that needs real runtime side effects; those must stay in the main agent.",
     parameters: {
       type: "OBJECT",
       properties: {
@@ -2086,7 +2087,25 @@ async function executeTool(
   projectId: number,
   projectDir: string,
   loadedSkills?: Set<string>
-): Promise<{ result: string; fileChanged?: { path: string; action: string; before?: string; after?: string }; previewPort?: number; verifiedListening?: boolean }> {
+): Promise<{
+  result: string;
+  fileChanged?: { path: string; action: string; before?: string; after?: string };
+  previewPort?: number;
+  verifiedListening?: boolean;
+  browserSession?: {
+    tool: "playwright_run";
+    status: "ok" | "failed";
+    finalUrl?: string;
+    htmlPath?: string | null;
+    harPath?: string | null;
+    pdfPath?: string | null;
+    screenshots?: string[];
+    screenshotDataUrl?: string | null;
+    actionLog?: string[];
+    evalResults?: { index: number; expression: string; result: string }[];
+    error?: string | null;
+  };
+}> {
   switch (toolName) {
     case "think": {
       return { result: "Thinking recorded. Continue with your plan." };
@@ -2759,10 +2778,10 @@ async function executeTool(
       let page: Page | null = null;
       const log: string[] = [];
       const evalResults: any[] = [];
-      const screenshots: string[] = [];
-      const startedAt = Date.now();
-      let timedOut = false;
-      const timeoutHandle = setTimeout(() => { timedOut = true; try { context?.close().catch(() => {}); browser?.close().catch(() => {}); } catch {} }, totalDeadline);
+        const screenshots: string[] = [];
+        const startedAt = Date.now();
+        let timedOut = false;
+        const timeoutHandle = setTimeout(() => { timedOut = true; try { context?.close().catch(() => {}); browser?.close().catch(() => {}); } catch {} }, totalDeadline);
 
       try {
         browser = await chromium.launch({
@@ -2888,6 +2907,21 @@ async function executeTool(
         const finalUrl = page.url();
         let htmlPath: string | null = null;
         let pdfPath: string | null = null;
+        let screenshotDataUrl: string | null = null;
+        try {
+          const finalShot = await page.screenshot({ fullPage: false, type: "png" });
+          if (finalShot.length <= 25 * 1024 * 1024) {
+            const t = await safeWriteBuf(`${baseName}__final.png`, finalShot);
+            screenshots.push(`playwright/${pathLib.basename(t)}`);
+            if (finalShot.length <= 4 * 1024 * 1024) {
+              screenshotDataUrl = `data:image/png;base64,${finalShot.toString("base64")}`;
+            }
+          } else {
+            log.push("final screenshot dropped (>25MB)");
+          }
+        } catch (err: any) {
+          log.push(`final screenshot ERROR: ${err.message}`);
+        }
         if (saveHtml && !timedOut) {
           try {
             const html = await page.content();
@@ -2924,12 +2958,37 @@ async function executeTool(
         summary.push("");
         summary.push("Action log:");
         summary.push(log.join("\n"));
-        return { result: summary.join("\n"), fileChanged: htmlPath ? { path: htmlPath, action: "created" } : undefined };
+        return {
+          result: summary.join("\n"),
+          fileChanged: htmlPath ? { path: htmlPath, action: "created" } : undefined,
+          browserSession: {
+            tool: "playwright_run",
+            status: "ok",
+            finalUrl,
+            htmlPath,
+            harPath,
+            pdfPath,
+            screenshots,
+            screenshotDataUrl,
+            actionLog: log.slice(-50),
+            evalResults,
+            error: timedOut ? `Timed out after ${totalDeadline}ms` : null,
+          },
+        };
       } catch (err: any) {
         clearTimeout(timeoutHandle);
         try { await context?.close(); } catch {}
         try { await browser?.close(); } catch {}
-        return { result: `playwright_run failed: ${err.message?.slice(0, 500)}\n\nLog:\n${log.join("\n")}` };
+        return {
+          result: `playwright_run failed: ${err.message?.slice(0, 500)}\n\nLog:\n${log.join("\n")}`,
+          browserSession: {
+            tool: "playwright_run",
+            status: "failed",
+            screenshots,
+            actionLog: log.slice(-50),
+            error: err.message?.slice(0, 500) ?? "Playwright run failed",
+          },
+        };
       }
     }
 
@@ -4822,7 +4881,7 @@ async function executeTool(
           const name = raw.trim();
           if (!name) continue;
           if (!SUBAGENT_EXTRA_ALLOWED.has(name)) {
-            return { result: `Error: tool "${name}" is not allowed in subagents (state-changing). Allowed extras: ${Array.from(SUBAGENT_EXTRA_ALLOWED).join(", ")}` };
+            return { result: `Error: tool "${name}" is not allowed in subagents (state-changing). Browser automation and Playwright tasks must run in the main agent so the user can see the browser state. Allowed extras: ${Array.from(SUBAGENT_EXTRA_ALLOWED).join(", ")}` };
           }
           allowed.add(name);
         }
@@ -5162,12 +5221,14 @@ async function executeTool(
 }
 
 router.post("/ai/agent", async (req, res): Promise<void> => {
-  const { message, projectId, history, images, loaded_skills: loadedSkillsFromClient } = req.body as {
+  const { message, projectId, history, images, loaded_skills: loadedSkillsFromClient, providerOverride, modelOverride } = req.body as {
     message: string;
     projectId: number;
     history?: { role: string; content: string }[];
     images?: { mimeType: string; dataBase64: string }[];
     loaded_skills?: string[];
+    providerOverride?: string;
+    modelOverride?: string;
   };
 
   // Wave 14 — lazy skill loading. Seed from client (so reloaded across turns).
@@ -5187,9 +5248,9 @@ router.post("/ai/agent", async (req, res): Promise<void> => {
     return;
   }
 
-  const settings = await getActiveProvider();
+  const settings = await resolveProviderSelection(providerOverride, modelOverride);
   if (!settings) {
-    res.status(503).json({ error: "AI not configured. Add your API key in the admin panel." });
+    res.status(503).json({ error: "Selected AI provider is not configured or is unavailable. Please change provider or add the required key in the admin panel." });
     return;
   }
   const fallback = await getFallbackProvider();
@@ -5590,13 +5651,14 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
 
           for (let i = 0; i < results.length; i++) {
             const tc = agentResult.toolCalls[i];
-            const { result, fileChanged, previewPort, verifiedListening } = results[i];
+            const { result, fileChanged, previewPort, verifiedListening, browserSession } = results[i];
             const compacted = compactToolResult(tc.name, result);
 
             sendEvent({
               type: "tool_result", id: callIds[i], tool: tc.name,
               result: compacted.length > 800 ? compacted.slice(0, 800) + "..." : compacted,
             });
+            if (browserSession) sendEvent({ type: "browser_session", ...browserSession });
 
             if (fileChanged) {
               filesChangedThisTurn.add(fileChanged.path);
@@ -5644,13 +5706,14 @@ When the user asks you to reverse engineer, clone, recreate, or "make me a copy 
 
             sendEvent({ type: "tool_call", id: callId, tool: tc.name, args: displayArgs });
 
-            const { result, fileChanged, previewPort, verifiedListening } = await executeTool(tc.name, tc.args, projectId, projectDir, loadedSkills);
+            const { result, fileChanged, previewPort, verifiedListening, browserSession } = await executeTool(tc.name, tc.args, projectId, projectDir, loadedSkills);
             const compacted = compactToolResult(tc.name, result);
 
             sendEvent({
               type: "tool_result", id: callId, tool: tc.name,
               result: compacted.length > 800 ? compacted.slice(0, 800) + "..." : compacted,
             });
+            if (browserSession) sendEvent({ type: "browser_session", ...browserSession });
 
             if (fileChanged) {
               filesChangedThisTurn.add(fileChanged.path);

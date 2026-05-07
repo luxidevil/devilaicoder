@@ -2,6 +2,11 @@ import { Router, type IRouter } from "express";
 import { eq, count, desc, sql, gte } from "drizzle-orm";
 import { db, settingsTable, projectsTable, filesTable, aiRequestsTable } from "@workspace/db";
 import {
+  getEnvActiveModel,
+  getEnvDefaultProvider,
+  getEnvProviderApiKey,
+  getEnvProviderBaseURL,
+  getEnvProviderModel,
   invalidateSettingsCache,
   PROVIDER_CONFIGS,
   PROVIDER_NAMES,
@@ -45,46 +50,18 @@ async function deleteSetting(key: string): Promise<void> {
   await db.delete(settingsTable).where(eq(settingsTable.key, key));
 }
 
-const ENV_KEY_MAP: Record<ProviderName, string> = {
-  gemini: "GOOGLE_API_KEY",
-  vertex: "VERTEX_API_KEY",
-  anthropic: "ANTHROPIC_API_KEY",
-  openai: "OPENAI_API_KEY",
-  openrouter: "OPENROUTER_API_KEY",
-  groq: "GROQ_API_KEY",
-  moonshot: "MOONSHOT_API_KEY",
-  deepseek: "DEEPSEEK_API_KEY",
-  together: "TOGETHER_API_KEY",
-  mistral: "MISTRAL_API_KEY",
-  xai: "XAI_API_KEY",
-  cerebras: "CEREBRAS_API_KEY",
-  github: "GITHUB_MODELS_TOKEN",
-  huggingface: "HUGGINGFACE_API_KEY",
-  cloudflare: "CLOUDFLARE_API_KEY",
-  sambanova: "SAMBANOVA_API_KEY",
-  nvidia: "NVIDIA_API_KEY",
-  fireworks: "FIREWORKS_API_KEY",
-  hyperbolic: "HYPERBOLIC_API_KEY",
-  perplexity: "PERPLEXITY_API_KEY",
-  cohere: "COHERE_API_KEY",
-  zhipu: "ZHIPU_API_KEY",
-  qwen: "DASHSCOPE_API_KEY",
-  pollinations: "POLLINATIONS_API_KEY",
-  ollama: "OLLAMA_API_KEY",
-  custom: "CUSTOM_API_KEY",
-};
-
 async function buildSettingsPayload() {
-  const provider = ((await getSetting("ai_provider")) ?? "gemini") as ProviderName;
+  const provider = (((await getSetting("ai_provider")) as ProviderName | null) ?? getEnvDefaultProvider() ?? "gemini") as ProviderName;
   const fallbackProvider = (await getSetting("ai_fallback_provider")) as ProviderName | null;
   const updatedAt = await getSetting("settings_updated_at");
 
   const providers: Record<string, any> = {};
   for (const p of PROVIDER_NAMES) {
     const cfg = PROVIDER_CONFIGS[p];
-    const apiKey = (await getSetting(`${p}_api_key`)) || process.env[ENV_KEY_MAP[p]] || "";
-    const model = (await getSetting(`${p}_model`)) || cfg.defaultModel;
-    const baseURL = (await getSetting(`${p}_base_url`)) || cfg.defaultBaseURL || "";
+    const storedApiKey = await getSetting(`${p}_api_key`);
+    const apiKey = storedApiKey || getEnvProviderApiKey(p) || "";
+    const model = (await getSetting(`${p}_model`)) || getEnvProviderModel(p) || cfg.defaultModel;
+    const baseURL = (await getSetting(`${p}_base_url`)) || getEnvProviderBaseURL(p) || cfg.defaultBaseURL || "";
     providers[p] = {
       name: p,
       label: cfg.label,
@@ -94,7 +71,7 @@ async function buildSettingsPayload() {
       signupURL: cfg.signupURL,
       needsKey: cfg.needsKey,
       keyConfigured: !!apiKey,
-      keyFromEnv: !apiKey ? false : !(await getSetting(`${p}_api_key`)),
+      keyFromEnv: !apiKey ? false : !storedApiKey,
       model,
       baseURL,
       defaultBaseURL: cfg.defaultBaseURL ?? null,
@@ -107,6 +84,7 @@ async function buildSettingsPayload() {
   const activeModel =
     (await getSetting("ai_model")) ||
     (await getSetting(`${provider}_model`)) ||
+    getEnvActiveModel(provider) ||
     PROVIDER_CONFIGS[provider]?.defaultModel ||
     "";
 
